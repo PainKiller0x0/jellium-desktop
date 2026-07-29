@@ -23,7 +23,7 @@ use wry::{WebContext, WebViewBuilder};
 
 const NORD_CSS_URL: &str = "https://theme-park.dev/css/base/jellyfin/nord.css";
 const LOCAL_PROXY_PORT: u16 = 39782;
-const FRONTEND_CACHE_BUSTER: &str = "series-compat-1";
+const FRONTEND_CACHE_BUSTER: &str = "series-compat-4";
 
 struct ProxyState {
     root: PathBuf,
@@ -414,9 +414,12 @@ fn rewrite_children_url(
         }
         params.push(pair.to_string());
     }
-    if !params.iter().any(|pair| pair.starts_with("userId=")) {
-        params.push(format!("userId={user_id}"));
-    }
+    params.retain(|pair| {
+        let key = pair.split('=').next().unwrap_or_default();
+        let decoded_key = percent_decode_str(key).decode_utf8_lossy();
+        decoded_key != "userId" && decoded_key != "UserId"
+    });
+    params.push(format!("UserId={user_id}"));
     if let Some(season_id) = season_id {
         params.push(format!("SeasonId={season_id}"));
     }

@@ -5,8 +5,7 @@ use std::path::PathBuf;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
 
-    #[cfg(windows)]
-    {
+    if env::var("CARGO_CFG_WINDOWS").as_deref() == Ok("true") {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let repo_root = manifest_dir.parent().ok_or("win-wb2 has no repository root")?;
         let icon_path = repo_root.join("resources").join("win").join("jellyfin.ico");
@@ -17,8 +16,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(&rc_path, format!("IDI_ICON1 ICON \"{icon_path}\"\n"))?;
         embed_resource::compile(&rc_path, embed_resource::NONE).manifest_required()?;
 
-        println!("cargo:rustc-link-arg-bins=/SUBSYSTEM:WINDOWS");
-        println!("cargo:rustc-link-arg-bins=/ENTRY:mainCRTStartup");
+        if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            println!("cargo:rustc-link-arg-bins=/SUBSYSTEM:WINDOWS");
+            println!("cargo:rustc-link-arg-bins=/ENTRY:mainCRTStartup");
+        }
     }
 
     Ok(())
