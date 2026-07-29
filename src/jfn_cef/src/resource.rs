@@ -142,9 +142,31 @@ fn patch_jellyfin_rs_min_version(relative: &str, mut bytes: Vec<u8>) -> Vec<u8> 
     bytes
 }
 
+const THEMEPARK_NORD_CSS_URL: &str =
+    "https://theme-park.dev/css/base/jellyfin/nord.css";
+
+fn patch_jellyfin_web_index(relative: &str, mut bytes: Vec<u8>) -> Vec<u8> {
+    if relative != "index.html" {
+        return bytes;
+    }
+
+    let marker = b"</head>";
+    let Some(position) = bytes.windows(marker.len()).position(|window| window == marker) else {
+        return bytes;
+    };
+    let link = format!(
+        r#"<link rel="stylesheet" href="{THEMEPARK_NORD_CSS_URL}">"#
+    );
+    bytes.splice(position..position, link.into_bytes());
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{patch_jellyfin_rs_min_version, percent_decode_path};
+    use super::{
+        patch_jellyfin_rs_min_version, patch_jellyfin_web_index, percent_decode_path,
+        THEMEPARK_NORD_CSS_URL,
+    };
 
     #[test]
     fn decodes_encoded_at_sign_and_utf8() {
@@ -172,6 +194,17 @@ mod tests {
         assert_eq!(
             patch_jellyfin_rs_min_version("main.jellyfin.bundle.js", b"10.10.0".to_vec()),
             b"10.10.0".to_vec()
+        );
+    }
+
+    #[test]
+    fn injects_nord_theme_only_into_web_index() {
+        let patched = patch_jellyfin_web_index("index.html", b"<head></head>".to_vec());
+        let html = String::from_utf8(patched).unwrap();
+        assert!(html.contains(THEMEPARK_NORD_CSS_URL));
+        assert_eq!(
+            patch_jellyfin_web_index("manifest.json", b"<head></head>".to_vec()),
+            b"<head></head>".to_vec()
         );
     }
 }
@@ -227,6 +260,7 @@ fn lookup_jellyfin_web(url_path: &str) -> Option<(Vec<u8>, String)> {
         std::fs::read(&path).ok()?
     };
     let bytes = patch_jellyfin_rs_min_version(&relative, bytes);
+    let bytes = patch_jellyfin_web_index(&relative, bytes);
     Some((bytes, mime_for(&path).to_string()))
 }
 
