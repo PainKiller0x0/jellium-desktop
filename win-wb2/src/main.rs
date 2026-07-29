@@ -362,7 +362,7 @@ fn rewrite_series_children_request(
     if segments.len() != 3 || segments[0] != "Users" || segments[2] != "Items" {
         return None;
     }
-    if query_param(query, "IncludeItemTypes")?.as_deref() != Some("Series") {
+    if query_param(query, "IncludeItemTypes")?.as_str() != "Series" {
         return None;
     }
     let parent_id = query_param(query, "ParentId")?;
