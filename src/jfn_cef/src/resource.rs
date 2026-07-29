@@ -372,6 +372,21 @@ wrap_resource_handler! {
                 rsp.set_status(200);
                 rsp.set_status_text(Some(&CefString::from("OK")));
                 rsp.set_mime_type(Some(&CefString::from(self.inner.mime.as_str())));
+                rsp.set_header_by_name(
+                    Some(&CefString::from("Access-Control-Allow-Origin")),
+                    Some(&CefString::from("*")),
+                    1,
+                );
+                rsp.set_header_by_name(
+                    Some(&CefString::from("Access-Control-Allow-Methods")),
+                    Some(&CefString::from("GET, OPTIONS")),
+                    1,
+                );
+                rsp.set_header_by_name(
+                    Some(&CefString::from("Access-Control-Allow-Headers")),
+                    Some(&CefString::from("*")),
+                    1,
+                );
             }
             if let Some(rl) = response_length { *rl = len; }
         }
