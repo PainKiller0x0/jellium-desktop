@@ -1,0 +1,43 @@
+name: build-windows-wb2
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - win-wb2
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build WebView2 prototype
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --manifest-path win-wb2/Cargo.toml --release
+
+          $dist = Join-Path $PWD 'dist\jellium-win-wb2'
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item 'target\release\jellium-win-wb2.exe' $dist -Force
+          Copy-Item 'resources\jellyfin-web' (Join-Path $dist 'jellyfin-web') -Recurse -Force
+          Set-Content (Join-Path $dist 'README.txt') @(
+            'Jellium Desktop Windows WebView2 prototype'
+            'Requires the Microsoft Edge WebView2 Evergreen Runtime.'
+            'Set JELLIUM_SERVER_URL to override the saved Jellyfin server URL.'
+          )
+          Compress-Archive -Path (Join-Path $dist '*') -DestinationPath 'dist\jellium-win-wb2-windows-x64.zip' -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: jellium-win-wb2-windows-x64
+          path: dist/jellium-win-wb2-windows-x64.zip
