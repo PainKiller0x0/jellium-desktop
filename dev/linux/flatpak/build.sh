@@ -20,6 +20,16 @@ RUNTIME_VERSION="25.08"
 command -v flatpak >/dev/null || { echo "Error: flatpak not found"; exit 1; }
 command -v flatpak-builder >/dev/null || { echo "Error: flatpak-builder not found"; exit 1; }
 
+# flatpak-builder downloads manifest sources on the host. Some runner images
+# do not pass the system CA bundle to its downloader, which causes TLS errors
+# such as: "CAfile: none CRLfile: none". Export the standard bundle paths
+# before any source fetch or SDK operation.
+if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+    export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+    export CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+    export GIT_SSL_CAINFO=/etc/ssl/certs/ca-certificates.crt
+fi
+
 # Install SDK and runtime if needed
 if ! flatpak info --user org.freedesktop.Sdk//$RUNTIME_VERSION >/dev/null 2>&1 && \
    ! flatpak info --system org.freedesktop.Sdk//$RUNTIME_VERSION >/dev/null 2>&1; then
