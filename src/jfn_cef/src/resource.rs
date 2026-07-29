@@ -125,9 +125,26 @@ fn percent_decode_path(input: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+// jellyfin-rs exposes an Emby-compatible API and reports its compatibility
+// version as 4.8.0.0. The bundled Jellyfin Web client has a hard-coded
+// minimum of 10.10.0, even though jellyfin-rs implements the API surface it
+// needs. Lower that guard only in the SDK bundle served by this desktop app.
+fn patch_jellyfin_rs_min_version(relative: &str, mut bytes: Vec<u8>) -> Vec<u8> {
+    if relative != "node_modules.@jellyfin.sdk.bundle.js" {
+        return bytes;
+    }
+
+    let from = b"10.10.0";
+    let to = b"4.8.0.0";
+    if let Some(start) = bytes.windows(from.len()).position(|window| window == from) {
+        bytes[start..start + to.len()].copy_from_slice(to);
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
-    use super::percent_decode_path;
+    use super::{patch_jellyfin_rs_min_version, percent_decode_path};
 
     #[test]
     fn decodes_encoded_at_sign_and_utf8() {
@@ -141,6 +158,21 @@ mod tests {
     fn rejects_invalid_escape_sequences() {
         assert_eq!(percent_decode_path("broken%2"), None);
         assert_eq!(percent_decode_path("broken%GG"), None);
+    }
+
+    #[test]
+    fn patches_only_the_jellyfin_sdk_bundle() {
+        assert_eq!(
+            patch_jellyfin_rs_min_version(
+                "node_modules.@jellyfin.sdk.bundle.js",
+                b"minimum=10.10.0".to_vec()
+            ),
+            b"minimum=4.8.0.0".to_vec()
+        );
+        assert_eq!(
+            patch_jellyfin_rs_min_version("main.jellyfin.bundle.js", b"10.10.0".to_vec()),
+            b"10.10.0".to_vec()
+        );
     }
 }
 
@@ -194,6 +226,7 @@ fn lookup_jellyfin_web(url_path: &str) -> Option<(Vec<u8>, String)> {
     } else {
         std::fs::read(&path).ok()?
     };
+    let bytes = patch_jellyfin_rs_min_version(&relative, bytes);
     Some((bytes, mime_for(&path).to_string()))
 }
 
