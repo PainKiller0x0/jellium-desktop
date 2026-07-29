@@ -79,12 +79,12 @@ fn main() -> wry::Result<()> {
 
     event_loop.run(move |event, _event_loop, control_flow| {
         *control_flow = ControlFlow::Wait;
+        let _keep_webview_alive = &webview;
         if let Event::WindowEvent {
             event: WindowEvent::CloseRequested,
             ..
         } = event
         {
-            drop(webview);
             *control_flow = ControlFlow::Exit;
         }
     });
@@ -216,7 +216,7 @@ fn proxy_request(request: TinyRequest, state: &ProxyState, url: &str) {
         .method(method.as_str())
         .uri(upstream_url);
     for header in request.headers() {
-        let name = header.field.as_str();
+        let name: &str = header.field.as_str().into();
         if should_forward_request_header(name) {
             builder = builder.header(name, header.value.as_str());
         }
@@ -240,8 +240,8 @@ fn proxy_request(request: TinyRequest, state: &ProxyState, url: &str) {
             let status = upstream_response.status().as_u16();
             let headers = upstream_response.headers().clone();
             let reader = upstream_response.into_body().into_reader();
-            let mut response = TinyResponse::from_reader(reader)
-                .with_status_code(TinyStatusCode(status));
+            let mut response =
+                TinyResponse::new(TinyStatusCode(status), Vec::new(), reader, None, None);
             for (name, value) in &headers {
                 if should_forward_response_header(name.as_str())
                     && let Ok(header) = Header::from_bytes(
