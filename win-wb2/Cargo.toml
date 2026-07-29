@@ -1,0 +1,18 @@
+[package]
+name = "jellium-win-wb2"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "jellium-win-wb2"
+path = "src/main.rs"
+
+[dependencies]
+mime_guess = "2"
+percent-encoding = "2"
+serde_json = "1"
+tao = "0.35.3"
+tiny_http = "0.12"
+ureq = "3.3"
+wry = { version = "0.55.1", default-features = false, features = ["os-webview", "protocol", "devtools"] }
