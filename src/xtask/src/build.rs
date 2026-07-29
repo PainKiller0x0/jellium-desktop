@@ -102,5 +102,11 @@ pub fn run(args: &BuildArgs) -> Result<()> {
 
     crate::platform::stage_cef(&out, &cef_info)?;
     crate::platform::stage_mpv(&out, &mpv_info, used_external_mpv, &bin_dst)?;
+
+    let web_src = paths::repo_root().join("resources").join("jellyfin-web");
+    if !web_src.is_dir() {
+        bail!("bundled Jellyfin Web assets not found: {}", web_src.display());
+    }
+    xfs::copy_dir_recursive(&web_src, &out.join("jellyfin-web"))?;
     Ok(())
 }

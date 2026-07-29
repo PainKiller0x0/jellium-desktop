@@ -41,5 +41,9 @@ pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<Path
         let runtime = mpv::runtime_library_name();
         xfs::copy_file(&build_dir.join(runtime), &prefix.join(runtime))?;
     }
+    xfs::copy_dir_recursive(
+        &build_dir.join("jellyfin-web"),
+        &prefix.join("jellyfin-web"),
+    )?;
     Ok(prefix.to_path_buf())
 }

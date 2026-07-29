@@ -24,7 +24,7 @@ use crate::client::{
 };
 use crate::ipc::{BrowserMessage, list_opt_string, list_string, send_to_renderer};
 use jfn_color::theme::jfn_theme_color_on_overlay_dismissed;
-use jfn_jellyfin::{extract_base_url, is_valid_public_info, normalize_input};
+use jfn_jellyfin::{LOCAL_WEB_URL, extract_base_url, is_valid_public_info, normalize_input};
 
 struct OverlayState {
     main_layer: Arc<Inner>,
@@ -121,7 +121,10 @@ fn handle_message(message: BrowserMessage) -> bool {
             jfn_config::set_server_url(&url);
             jfn_config::settings_save_async();
             if let Some(ml) = main_layer_arc() {
-                ml.load_url(&url);
+                // Keep the browser on the bundled Jellyfin Web frontend. The
+                // local config.json is generated from the saved server URL,
+                // so the frontend still talks directly to the remote API.
+                ml.load_url(LOCAL_WEB_URL);
             }
             true
         }

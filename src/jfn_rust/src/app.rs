@@ -7,6 +7,7 @@ use std::sync::OnceLock;
 
 use clap::Parser;
 use jfn_cef::{APP_VERSION_FULL, cef_version};
+use jfn_jellyfin::LOCAL_WEB_URL;
 use jfn_platform_abi::{IdleInhibitLevel, LogicalSize, Platform, WindowGeometry};
 
 use crate::cli;
@@ -516,12 +517,17 @@ fn init_main_browser(
     jfn_cef::business_web::jfn_web_init(main_layer);
 
     let server_url = jfn_config::server_url();
-    tracing::info!(target: "Main", "[FLOW] CreateBrowser(main) url={server_url}");
+    tracing::info!(
+        target: "Main",
+        "[FLOW] CreateBrowser(main) local_frontend={} configured_server={}",
+        LOCAL_WEB_URL,
+        if server_url.is_empty() { "<none>" } else { "<configured>" },
+    );
     unsafe {
         jfn_cef::client::jfn_cef_layer_create(
             main_layer,
-            server_url.as_ptr() as *const _,
-            server_url.len(),
+            LOCAL_WEB_URL.as_ptr() as *const _,
+            LOCAL_WEB_URL.len(),
         );
     }
     tracing::info!(target: "Main", "[FLOW] CreateBrowser(main) call returned");

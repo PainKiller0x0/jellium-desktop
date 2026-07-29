@@ -8,6 +8,7 @@
 //!   prepended to the static about.js body.
 
 use cef::*;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -53,6 +54,100 @@ fn lookup(url_path: &str) -> Option<&'static Embedded> {
     // URL key has the "resources/" prefix; strip it to match RESOURCES.
     let name = url_path.strip_prefix("resources/")?;
     RESOURCES.iter().find(|(n, _)| *n == name).map(|(_, r)| r)
+}
+
+fn jellyfin_web_root() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("JELLIUM_WEB_DIR") {
+        let path = PathBuf::from(path);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        let path = parent.join("jellyfin-web");
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+
+    // This fallback keeps `cargo run` useful during development, while
+    // packaged builds use the directory next to the executable above.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("resources")
+        .join("jellyfin-web");
+    path.is_dir().then_some(path)
+}
+
+fn safe_web_path(root: &Path, relative: &str) -> Option<PathBuf> {
+    let path = Path::new(relative);
+    if relative.is_empty()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    Some(root.join(path))
+}
+
+fn web_config(root: &Path) -> Option<Vec<u8>> {
+    use serde_json::{Value, json};
+
+    let path = root.join("config.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    let object = config.as_object_mut()?;
+    let server_url = jfn_config::server_url();
+    let servers = if server_url.is_empty() {
+        Vec::new()
+    } else {
+        vec![json!(server_url)]
+    };
+    object.insert("servers".to_string(), Value::Array(servers));
+    object.insert("multiserver".to_string(), Value::Bool(false));
+    serde_json::to_vec(&config).ok()
+}
+
+fn mime_for(path: &Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
+        "html" => "text/html",
+        "js" => "application/javascript",
+        "css" => "text/css",
+        "json" | "map" | "webmanifest" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "webp" => "image/webp",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "wasm" => "application/wasm",
+        "mp3" => "audio/mpeg",
+        "mp4" => "video/mp4",
+        "m3u8" => "application/vnd.apple.mpegurl",
+        "ts" => "video/mp2t",
+        _ => "application/octet-stream",
+    }
+}
+
+fn lookup_jellyfin_web(url_path: &str) -> Option<(Vec<u8>, String)> {
+    let relative = url_path.strip_prefix("resources/jellyfin-web/")?;
+    let root = jellyfin_web_root()?;
+    let path = safe_web_path(&root, relative)?;
+    let bytes = if relative == "config.json" {
+        web_config(&root)?
+    } else {
+        std::fs::read(&path).ok()?
+    };
+    Some((bytes, mime_for(&path).to_string()))
 }
 
 // Background color from src/color.h:40 — kBgColor{0x101010}.
@@ -135,12 +230,14 @@ wrap_scheme_handler_factory! {
                 .unwrap_or("")
                 .to_string();
 
-            let (bytes, mime): (Vec<u8>, &'static str) = if url_path == "resources/theme.css" {
-                (theme_css(), "text/css")
+            let (bytes, mime): (Vec<u8>, String) = if url_path == "resources/theme.css" {
+                (theme_css(), "text/css".to_string())
             } else if url_path == "resources/about.js" {
-                (about_js_payload(), "application/javascript")
+                (about_js_payload(), "application/javascript".to_string())
+            } else if let Some(resource) = lookup_jellyfin_web(&url_path) {
+                resource
             } else if let Some(r) = lookup(&url_path) {
-                (r.bytes.to_vec(), r.mime)
+                (r.bytes.to_vec(), r.mime.to_string())
             } else {
                 jfn_logging::log(
                     jfn_logging::CATEGORY_RESOURCE,
@@ -166,7 +263,7 @@ wrap_scheme_handler_factory! {
 #[derive(Clone)]
 pub(crate) struct JfnResourceHandler {
     bytes: Arc<Vec<u8>>,
-    mime: &'static str,
+    mime: String,
     offset: Arc<AtomicUsize>,
 }
 
@@ -194,7 +291,7 @@ wrap_resource_handler! {
             if let Some(rsp) = response {
                 rsp.set_status(200);
                 rsp.set_status_text(Some(&CefString::from("OK")));
-                rsp.set_mime_type(Some(&CefString::from(self.inner.mime)));
+                rsp.set_mime_type(Some(&CefString::from(self.inner.mime.as_str())));
             }
             if let Some(rl) = response_length { *rl = len; }
         }

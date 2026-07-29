@@ -43,5 +43,9 @@ pub fn install(build_dir: &Path, prefix: &Path, args: &BuildArgs) -> Result<Path
     if let Some(dir) = &args.external_mpv {
         xfs::copy_glob(&dir.join("lib"), prefix, &["*.dll"])?;
     }
+    xfs::copy_dir_recursive(
+        &build_dir.join("jellyfin-web"),
+        &prefix.join("jellyfin-web"),
+    )?;
     Ok(prefix.to_path_buf())
 }

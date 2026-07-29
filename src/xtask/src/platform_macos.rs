@@ -137,6 +137,11 @@ pub fn install(build_dir: &Path, prefix: &Path, _args: &crate::BuildArgs) -> Res
         &icd_dst,
     )?;
 
+    xfs::copy_dir_recursive(
+        &build_dir.join("jellyfin-web"),
+        &macos_dir.join("jellyfin-web"),
+    )?;
+
     // Complete the bundle: dep-walk, install_name rewrites, codesign.
     bundle_macos::complete(&app)?;
     Ok(app)
