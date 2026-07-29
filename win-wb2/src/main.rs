@@ -201,7 +201,7 @@ fn serve_static(
     }
 }
 
-fn proxy_request(request: TinyRequest, state: &ProxyState, url: &str) {
+fn proxy_request(mut request: TinyRequest, state: &ProxyState, url: &str) {
     let upstream_url = format!("{}{}", state.upstream, url);
     let method = request.method().to_string();
     let mut body = Vec::new();
