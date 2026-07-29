@@ -337,8 +337,10 @@ fn patch_index(mut bytes: Vec<u8>) -> Vec<u8> {
     else {
         return bytes;
     };
-    let link = format!(r#"<link rel="stylesheet" href="{NORD_CSS_URL}">"#);
-    bytes.splice(position..position, link.into_bytes());
+    let injected = format!(
+        r#"<script defer="defer" src="jellium-series-compat.js"></script><link rel="stylesheet" href="{NORD_CSS_URL}">"#
+    );
+    bytes.splice(position..position, injected.into_bytes());
     bytes
 }
 
@@ -421,6 +423,14 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&patched).unwrap();
         assert_eq!(value["servers"][0], "http://127.0.0.1:12345");
         assert_eq!(value["multiserver"], false);
+    }
+
+    #[test]
+    fn index_injects_series_compatibility_layer() {
+        let patched = super::patch_index(br#"<html><head></head></html>"#.to_vec());
+        let text = String::from_utf8(patched).unwrap();
+        assert!(text.contains("jellium-series-compat.js"));
+        assert!(text.contains("theme-park.dev/css/base/jellyfin/nord.css"));
     }
 
     #[test]
