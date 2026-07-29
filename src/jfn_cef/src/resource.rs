@@ -98,6 +98,52 @@ fn safe_web_path(root: &Path, relative: &str) -> Option<PathBuf> {
     Some(root.join(path))
 }
 
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_path(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = hex_digit(*bytes.get(index + 1)?)?;
+            let low = hex_digit(*bytes.get(index + 2)?)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::percent_decode_path;
+
+    #[test]
+    fn decodes_encoded_at_sign_and_utf8() {
+        assert_eq!(
+            percent_decode_path("node_modules.%40jellyfin/%E6%B5%8B%E8%AF%95.js"),
+            Some("node_modules.@jellyfin/测试.js".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_escape_sequences() {
+        assert_eq!(percent_decode_path("broken%2"), None);
+        assert_eq!(percent_decode_path("broken%GG"), None);
+    }
+}
+
 fn web_config(root: &Path) -> Option<Vec<u8>> {
     use serde_json::{Value, json};
 
@@ -139,9 +185,10 @@ fn mime_for(path: &Path) -> &'static str {
 }
 
 fn lookup_jellyfin_web(url_path: &str) -> Option<(Vec<u8>, String)> {
-    let relative = url_path.strip_prefix("resources/jellyfin-web/")?;
+    let encoded = url_path.strip_prefix("resources/jellyfin-web/")?;
+    let relative = percent_decode_path(encoded)?;
     let root = jellyfin_web_root()?;
-    let path = safe_web_path(&root, relative)?;
+    let path = safe_web_path(&root, &relative)?;
     let bytes = if relative == "config.json" {
         web_config(&root)?
     } else {
