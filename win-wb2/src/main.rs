@@ -3,23 +3,26 @@
 use std::env;
 use std::fs;
 use std::io::Read;
+use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
+use ico::IconDir;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
-use tao::window::WindowBuilder;
+use tao::window::{Icon, WindowBuilder};
 use tiny_http::{
     Header, Method as TinyMethod, Request as TinyRequest, Response as TinyResponse,
     Server, StatusCode as TinyStatusCode,
 };
 use ureq::Agent;
-use wry::WebViewBuilder;
+use wry::{WebContext, WebViewBuilder};
 
 const NORD_CSS_URL: &str = "https://theme-park.dev/css/base/jellyfin/nord.css";
+const LOCAL_PROXY_PORT: u16 = 39782;
 
 struct ProxyState {
     root: PathBuf,
@@ -37,13 +40,9 @@ fn main() -> wry::Result<()> {
     );
 
     let upstream = saved_server_url();
-    let server = Server::http("127.0.0.1:0").expect("create local Jellyfin proxy");
-    let port = server
-        .server_addr()
-        .to_ip()
-        .expect("local proxy must use an IP address")
-        .port();
-    let local_url = format!("http://127.0.0.1:{port}");
+    let server = Server::http(format!("127.0.0.1:{LOCAL_PROXY_PORT}"))
+        .expect("create local Jellyfin proxy on the stable port");
+    let local_url = format!("http://127.0.0.1:{LOCAL_PROXY_PORT}");
 
     let state = Arc::new(ProxyState {
         root,
@@ -67,27 +66,51 @@ fn main() -> wry::Result<()> {
     let event_loop = EventLoopBuilder::new().build();
     let window = WindowBuilder::new()
         .with_title("Jellium Desktop (WebView2)")
+        .with_window_icon(app_icon())
         .build(&event_loop)
         .expect("create WebView2 window");
     let start_url = format!("{local_url}/index.html");
-    let webview = WebViewBuilder::new()
+    let mut web_context = WebContext::new(Some(webview_data_dir()));
+    let webview = WebViewBuilder::new_with_web_context(&mut web_context)
         .with_devtools(true)
         .with_autoplay(true)
         .with_clipboard(true)
         .with_url(&start_url)
         .build(&window)?;
+    let mut webview = Some(webview);
 
     event_loop.run(move |event, _event_loop, control_flow| {
         *control_flow = ControlFlow::Wait;
-        let _keep_webview_alive = &webview;
-        if let Event::WindowEvent {
-            event: WindowEvent::CloseRequested,
-            ..
-        } = event
-        {
-            *control_flow = ControlFlow::Exit;
+        let _keep_context_alive = &web_context;
+        if let Event::WindowEvent { event, .. } = event {
+            if let WindowEvent::CloseRequested = event {
+                window.set_visible(false);
+                drop(webview.take());
+                *control_flow = ControlFlow::Exit;
+            }
         }
     });
+}
+
+fn webview_data_dir() -> PathBuf {
+    let base = env::var_os("LOCALAPPDATA")
+        .or_else(|| env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let path = base.join("jellium-desktop").join("webview2");
+    let _ = fs::create_dir_all(&path);
+    path
+}
+
+fn app_icon() -> Option<Icon> {
+    let bytes = include_bytes!("../../resources/win/jellyfin.ico");
+    let icon_dir = IconDir::read(Cursor::new(bytes)).ok()?;
+    let entry = icon_dir
+        .entries()
+        .iter()
+        .max_by_key(|entry| (entry.width() as u64) * (entry.height() as u64))?;
+    let image = entry.decode().ok()?;
+    Icon::from_rgba(image.rgba_data().to_vec(), image.width(), image.height()).ok()
 }
 
 fn web_root() -> PathBuf {
