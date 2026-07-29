@@ -114,7 +114,10 @@ modules:
         buildsystem: autotools
         sources:
           - type: archive
-            url: https://xorg.freedesktop.org/archive/individual/lib/libXpresent-1.0.2.tar.xz
+            # The upstream archive currently serves an expired TLS certificate.
+            # This mirror contains the same upstream tarball; keep the hash pin
+            # below so the source cannot silently change.
+            url: https://mirror.math.princeton.edu/pub/redcorelinux/amd64/distfiles/libXpresent-1.0.2.tar.xz
             sha256: 4e5b21b4812206a4b223013606ae31170502c1043038777a1ef8f70c09d37602
             x-checker-data:
               type: anitya
