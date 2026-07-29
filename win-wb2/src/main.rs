@@ -23,6 +23,7 @@ use wry::{WebContext, WebViewBuilder};
 
 const NORD_CSS_URL: &str = "https://theme-park.dev/css/base/jellyfin/nord.css";
 const LOCAL_PROXY_PORT: u16 = 39782;
+const FRONTEND_CACHE_BUSTER: &str = "series-compat-1";
 
 struct ProxyState {
     root: PathBuf,
@@ -69,7 +70,7 @@ fn main() -> wry::Result<()> {
         .with_window_icon(app_icon())
         .build(&event_loop)
         .expect("create WebView2 window");
-    let start_url = format!("{local_url}/index.html");
+    let start_url = format!("{local_url}/index.html?jellium={FRONTEND_CACHE_BUSTER}");
     let mut web_context = WebContext::new(Some(webview_data_dir()));
     let webview = WebViewBuilder::new_with_web_context(&mut web_context)
         .with_devtools(true)
@@ -338,7 +339,7 @@ fn patch_index(mut bytes: Vec<u8>) -> Vec<u8> {
         return bytes;
     };
     let injected = format!(
-        r#"<script defer="defer" src="jellium-series-compat.js"></script><link rel="stylesheet" href="{NORD_CSS_URL}">"#
+        r#"<script defer="defer" src="jellium-series-compat.js?v={FRONTEND_CACHE_BUSTER}"></script><link rel="stylesheet" href="{NORD_CSS_URL}">"#
     );
     bytes.splice(position..position, injected.into_bytes());
     bytes
