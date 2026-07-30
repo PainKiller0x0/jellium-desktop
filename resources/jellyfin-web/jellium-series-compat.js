@@ -1016,9 +1016,28 @@
             // redirect immediately opens this same detail page again.
             window.location.replace('#/details?id=' + encodeURIComponent(itemId));
         }, true);
-        // Only repair a collection route that was present when the app opened.
-        // Running this after every hash/popstate also catches the route produced
-        // by Back from a detail page and creates a redirect loop.
+
+        // Some Jellyfin cards navigate through the router without producing a
+        // click event that reaches the anchor interceptor. Keep the route
+        // fallback for those cards. The fallback uses replace() above, so the
+        // repaired /movies or /tv entry is not left behind in browser history.
+        window.addEventListener('hashchange', function () {
+            window.setTimeout(redirectPlayableCollectionRoute, 0);
+        });
+        window.addEventListener('popstate', function () {
+            window.setTimeout(redirectPlayableCollectionRoute, 0);
+        });
+
+        // Jellyfin's router can update the URL with history.pushState(), which
+        // emits neither hashchange nor popstate. Keep a lightweight safety net
+        // for non-anchor/programmatic navigation.
+        var lastRouteHash = window.location.hash;
+        window.setInterval(function () {
+            if (window.location.hash !== lastRouteHash) {
+                lastRouteHash = window.location.hash;
+                redirectPlayableCollectionRoute();
+            }
+        }, 200);
         window.setTimeout(redirectPlayableCollectionRoute, 0);
     }
 
