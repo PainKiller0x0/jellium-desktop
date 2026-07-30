@@ -5,7 +5,9 @@ use std::path::PathBuf;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
 
-    if env::var("CARGO_CFG_WINDOWS").as_deref() == Ok("true") {
+    if env::var_os("CARGO_CFG_WINDOWS").is_some()
+        || env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+    {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let repo_root = manifest_dir.parent().ok_or("win-wb2 has no repository root")?;
         let icon_path = repo_root.join("resources").join("win").join("jellyfin.ico");

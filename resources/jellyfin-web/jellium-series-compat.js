@@ -2153,12 +2153,10 @@
                 });
             };
 
-            var normalizedNetworkFetch = function () {
-                return networkFetch().then(function (response) {
-                    return normalizeMetadataResponse(request, response, nativeFetch);
-                });
-            };
-            return fetchWithMetadataCache(request, normalizedNetworkFetch).then(function (response) {
+            // Keep the cache payload raw and normalize exactly once after the
+            // cache/network decision. Normalizing both inside and outside the
+            // cache layer makes every detail/episode fallback request run twice.
+            return fetchWithMetadataCache(request, networkFetch).then(function (response) {
                 // Cached detail responses may predate this compatibility layer.
                 // Normalize those too, so an old zero-count entry cannot keep a
                 // series page empty forever.
