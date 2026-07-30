@@ -194,7 +194,40 @@
     }
 
     function metadataCacheKey(request) {
+        var url = new URL(request.url, window.location.href);
+        // Jellyfin changes this cutoff on every home-page refresh even though
+        // the underlying Next Up query is otherwise identical. Keeping it in
+        // the key defeats the persistent cache and makes cold starts rebuild
+        // the same home section over and over.
+        if (/\/Shows\/NextUp$/i.test(url.pathname)) {
+            url.searchParams.delete('NextUpDateCutoff');
+        }
+        return CACHE_VERSION + ':' + url.toString();
+    }
+
+    function legacyMetadataCacheKey(request) {
         return CACHE_VERSION + ':' + request.url;
+    }
+
+    function metadataCacheLookup(request, key) {
+        var legacyKey = legacyMetadataCacheKey(request);
+        return cacheGet(key).then(function (entry) {
+            if (entry || legacyKey === key) {
+                return entry;
+            }
+            // Migrate the old timestamped Next Up entry lazily so the first
+            // optimized launch can still reuse the cache from older builds.
+            return cacheGet(legacyKey).then(function (legacyEntry) {
+                if (!legacyEntry || typeof legacyEntry.body !== 'string') {
+                    return null;
+                }
+                var migrated = Object.assign({}, legacyEntry, { key: key });
+                cachePut(migrated).catch(function (error) {
+                    debug('缓存键迁移失败=' + (error && error.message || String(error)));
+                });
+                return migrated;
+            });
+        });
     }
 
     function metadataCacheMaxAge(request) {
@@ -203,7 +236,8 @@
             if (
                 /\/Items\/Latest$/i.test(url.pathname) ||
                 /\/Shows\/(NextUp|Upcoming)$/i.test(url.pathname) ||
-                /\/Search\/Hints$/i.test(url.pathname)
+                /\/Search\/Hints$/i.test(url.pathname) ||
+                /\/Items\/Resume$/i.test(url.pathname)
             ) {
                 return VOLATILE_CACHE_MAX_AGE_MS;
             }
@@ -382,7 +416,7 @@
 
         var lookup = metadataCacheLookups.get(key);
         if (!lookup) {
-            lookup = cacheGet(key);
+            lookup = metadataCacheLookup(request, key);
             metadataCacheLookups.set(key, lookup);
             lookup.then(function () {
                 if (metadataCacheLookups.get(key) === lookup) {

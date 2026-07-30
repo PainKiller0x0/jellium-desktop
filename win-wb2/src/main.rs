@@ -357,10 +357,19 @@ fn serve_static(
         bytes = patch_min_version(bytes);
     }
 
-    if request.method() == &TinyMethod::Head {
-        respond_bytes(request, 200, mime_for(path), Vec::new());
+    let cache_control = if relative.eq_ignore_ascii_case("index.html")
+        || relative.eq_ignore_ascii_case("config.json")
+    {
+        "no-cache"
     } else {
-        respond_bytes(request, 200, mime_for(path), bytes);
+        // All bundled assets are versioned by Jellyfin's filename/query hash;
+        // keeping them in WebView2's HTTP cache makes later cold starts local.
+        "public, max-age=31536000, immutable"
+    };
+    if request.method() == &TinyMethod::Head {
+        respond_static(request, 200, mime_for(path), cache_control, Vec::new());
+    } else {
+        respond_static(request, 200, mime_for(path), cache_control, bytes);
     }
 }
 
@@ -484,7 +493,7 @@ fn patch_index(mut bytes: Vec<u8>) -> Vec<u8> {
         return bytes;
     };
     let injected = format!(
-        r#"<script defer="defer" src="jellium-series-compat.js?v={FRONTEND_CACHE_BUSTER}"></script><link rel="stylesheet" href="{NORD_CSS_URL}">"#
+        r#"<script defer="defer" src="jellium-series-compat.js?v={FRONTEND_CACHE_BUSTER}"></script><link rel="preload" as="style" href="{NORD_CSS_URL}" onload="this.onload=null;this.rel='stylesheet'"><noscript><link rel="stylesheet" href="{NORD_CSS_URL}"></noscript>"#
     );
     bytes.splice(position..position, injected.into_bytes());
     bytes
@@ -660,6 +669,21 @@ fn respond_bytes(request: TinyRequest, status: u16, mime: &str, bytes: Vec<u8>) 
     let _ = request.respond(response);
 }
 
+fn respond_static(
+    request: TinyRequest,
+    status: u16,
+    mime: &str,
+    cache_control: &str,
+    bytes: Vec<u8>,
+) {
+    let response = TinyResponse::from_data(bytes)
+        .with_status_code(TinyStatusCode(status))
+        .with_header(cors_header("Content-Type", mime))
+        .with_header(cors_header("Cache-Control", cache_control))
+        .with_header(cors_header("Access-Control-Allow-Origin", "*"));
+    let _ = request.respond(response);
+}
+
 #[cfg(test)]
 mod tests {
     use super::{metadata_cache_route, patch_config, rewrite_children_url, safe_relative_path};
@@ -681,6 +705,7 @@ mod tests {
         let text = String::from_utf8(patched).unwrap();
         assert!(text.contains("jellium-series-compat.js"));
         assert!(text.contains("theme-park.dev/css/base/jellyfin/nord.css"));
+        assert!(text.contains("rel=\"preload\" as=\"style\""));
     }
 
     #[test]
