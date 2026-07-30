@@ -337,8 +337,10 @@ fn patch_index(mut bytes: Vec<u8>) -> Vec<u8> {
     else {
         return bytes;
     };
-    let link = format!(r#"<link rel="stylesheet" href="{NORD_CSS_URL}">"#);
-    bytes.splice(position..position, link.into_bytes());
+    let injected = format!(
+        r#"<link rel="stylesheet" href="{NORD_CSS_URL}"><script defer src="jellium-series-compat.js"></script>"#,
+    );
+    bytes.splice(position..position, injected.into_bytes());
     bytes
 }
 
@@ -410,7 +412,7 @@ fn respond_bytes(request: TinyRequest, status: u16, mime: &str, bytes: Vec<u8>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{patch_config, safe_relative_path};
+    use super::{patch_config, patch_index, safe_relative_path};
 
     #[test]
     fn config_points_the_web_client_at_the_same_origin_proxy() {
@@ -430,5 +432,12 @@ mod tests {
             safe_relative_path("/node_modules.%40jellyfin.sdk.bundle.js"),
             Some("node_modules.@jellyfin.sdk.bundle.js".to_string())
         );
+    }
+
+    #[test]
+    fn index_injects_nord_theme_and_jellium_compat_layer() {
+        let patched = String::from_utf8(patch_index(b"<head></head>".to_vec())).unwrap();
+        assert!(patched.contains("theme-park.dev/css/base/jellyfin/nord.css"));
+        assert!(patched.contains("jellium-series-compat.js"));
     }
 }
