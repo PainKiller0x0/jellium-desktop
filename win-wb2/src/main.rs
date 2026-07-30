@@ -23,6 +23,7 @@ use wry::{WebContext, WebViewBuilder};
 
 const NORD_CSS_URL: &str = "https://theme-park.dev/css/base/jellyfin/nord.css";
 const LOCAL_PROXY_PORT: u16 = 39782;
+const FRONTEND_CACHE_BUSTER: &str = "series-compat-4";
 
 struct ProxyState {
     root: PathBuf,
@@ -69,7 +70,7 @@ fn main() -> wry::Result<()> {
         .with_window_icon(app_icon())
         .build(&event_loop)
         .expect("create WebView2 window");
-    let start_url = format!("{local_url}/index.html");
+    let start_url = format!("{local_url}/index.html?jellium={FRONTEND_CACHE_BUSTER}");
     let mut web_context = WebContext::new(Some(webview_data_dir()));
     let webview = WebViewBuilder::new_with_web_context(&mut web_context)
         .with_devtools(true)
@@ -225,8 +226,14 @@ fn serve_static(
 }
 
 fn proxy_request(mut request: TinyRequest, state: &ProxyState, url: &str) {
-    let upstream_url = format!("{}{}", state.upstream, url);
     let method = request.method().to_string();
+    let rewritten_url = if request.method() == &TinyMethod::Get {
+        rewrite_series_children_request(&state.agent, &state.upstream, url, request.headers())
+            .unwrap_or_else(|| url.to_string())
+    } else {
+        url.to_string()
+    };
+    let upstream_url = format!("{}{}", state.upstream, rewritten_url);
     let mut body = Vec::new();
     if request.body_length().unwrap_or(0) > 0 {
         if request.as_reader().read_to_end(&mut body).is_err() {
@@ -338,10 +345,114 @@ fn patch_index(mut bytes: Vec<u8>) -> Vec<u8> {
         return bytes;
     };
     let injected = format!(
-        r#"<link rel="stylesheet" href="{NORD_CSS_URL}"><script defer src="jellium-series-compat.js"></script>"#,
+        r#"<script defer="defer" src="jellium-series-compat.js?v={FRONTEND_CACHE_BUSTER}"></script><link rel="stylesheet" href="{NORD_CSS_URL}">"#
     );
     bytes.splice(position..position, injected.into_bytes());
     bytes
+}
+
+fn rewrite_series_children_request(
+    agent: &Agent,
+    upstream: &str,
+    url: &str,
+    headers: &[Header],
+) -> Option<String> {
+    let (path, query) = url.split_once('?')?;
+    let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    if segments.len() != 3 || segments[0] != "Users" || segments[2] != "Items" {
+        return None;
+    }
+    if query_param(query, "IncludeItemTypes")?.as_str() != "Series" {
+        return None;
+    }
+    let parent_id = query_param(query, "ParentId")?;
+    let item_url = format!(
+        "{}/Users/{}/Items/{}",
+        upstream, segments[1], parent_id
+    );
+    let parent = get_json_with_headers(agent, &item_url, headers)?;
+    let item_type = parent.get("Type")?.as_str()?;
+
+    match item_type {
+        "Series" => Some(rewrite_children_url(
+            path,
+            query,
+            segments[1],
+            &parent_id,
+            "Seasons",
+            None,
+        )),
+        "Season" => Some(rewrite_children_url(
+            path,
+            query,
+            segments[1],
+            parent.get("SeriesId")?.as_str()?,
+            "Episodes",
+            Some(&parent_id),
+        )),
+        _ => None,
+    }
+}
+
+fn rewrite_children_url(
+    _original_path: &str,
+    query: &str,
+    user_id: &str,
+    parent_id: &str,
+    child_kind: &str,
+    season_id: Option<&str>,
+) -> String {
+    let mut params = Vec::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let key = pair.split('=').next().unwrap_or_default();
+        let decoded_key = percent_decode_str(key).decode_utf8_lossy();
+        if matches!(
+            decoded_key.as_ref(),
+            "ParentId" | "IncludeItemTypes" | "Recursive" | "SortBy" | "SortOrder"
+        ) {
+            continue;
+        }
+        params.push(pair.to_string());
+    }
+    params.retain(|pair| {
+        let key = pair.split('=').next().unwrap_or_default();
+        let decoded_key = percent_decode_str(key).decode_utf8_lossy();
+        decoded_key != "userId" && decoded_key != "UserId"
+    });
+    params.push(format!("UserId={user_id}"));
+    if let Some(season_id) = season_id {
+        params.push(format!("SeasonId={season_id}"));
+    }
+    format!("/Shows/{parent_id}/{child_kind}?{}", params.join("&"))
+}
+
+fn query_param(query: &str, wanted: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        let key = percent_decode_str(key).decode_utf8().ok()?;
+        if key != wanted {
+            return None;
+        }
+        Some(percent_decode_str(value).decode_utf8().ok()?.into_owned())
+    })
+}
+
+fn get_json_with_headers(agent: &Agent, url: &str, headers: &[Header]) -> Option<Value> {
+    let mut builder = ureq::http::Request::builder().method("GET").uri(url);
+    for header in headers {
+        let name: &str = header.field.as_str().into();
+        if should_forward_request_header(name) {
+            builder = builder.header(name, header.value.as_str());
+        }
+    }
+    let request = builder.body(Vec::new()).ok()?;
+    let response = agent.run(request).ok()?;
+    if response.status().as_u16() != 200 {
+        return None;
+    }
+    let mut body = String::new();
+    response.into_body().into_reader().read_to_string(&mut body).ok()?;
+    serde_json::from_str(&body).ok()
 }
 
 fn mime_for(path: &Path) -> &'static str {
@@ -412,7 +523,7 @@ fn respond_bytes(request: TinyRequest, status: u16, mime: &str, bytes: Vec<u8>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{patch_config, patch_index, safe_relative_path};
+    use super::{patch_config, rewrite_children_url, safe_relative_path};
 
     #[test]
     fn config_points_the_web_client_at_the_same_origin_proxy() {
@@ -426,18 +537,48 @@ mod tests {
     }
 
     #[test]
+    fn index_injects_series_compatibility_layer() {
+        let patched = super::patch_index(br#"<html><head></head></html>"#.to_vec());
+        let text = String::from_utf8(patched).unwrap();
+        assert!(text.contains("jellium-series-compat.js"));
+        assert!(text.contains("theme-park.dev/css/base/jellyfin/nord.css"));
+    }
+
+    #[test]
+    fn series_children_query_maps_to_seasons_endpoint() {
+        let rewritten = rewrite_children_url(
+            "/Users/user/Items",
+            "SortBy=SortName&IncludeItemTypes=Series&Recursive=true&Fields=Name&ParentId=series",
+            "user",
+            "series",
+            "Seasons",
+            None,
+        );
+        assert_eq!(rewritten, "/Shows/series/Seasons?Fields=Name&userId=user");
+    }
+
+    #[test]
+    fn season_children_query_maps_to_episodes_endpoint() {
+        let rewritten = rewrite_children_url(
+            "/Users/user/Items",
+            "SortBy=SortName&IncludeItemTypes=Series&Recursive=true&Fields=Name&ParentId=season",
+            "user",
+            "series",
+            "Episodes",
+            Some("season"),
+        );
+        assert_eq!(
+            rewritten,
+            "/Shows/series/Episodes?Fields=Name&userId=user&SeasonId=season"
+        );
+    }
+
+    #[test]
     fn traversal_paths_are_rejected() {
         assert!(safe_relative_path("/../secret").is_none());
         assert_eq!(
             safe_relative_path("/node_modules.%40jellyfin.sdk.bundle.js"),
             Some("node_modules.@jellyfin.sdk.bundle.js".to_string())
         );
-    }
-
-    #[test]
-    fn index_injects_nord_theme_and_jellium_compat_layer() {
-        let patched = String::from_utf8(patch_index(b"<head></head>".to_vec())).unwrap();
-        assert!(patched.contains("theme-park.dev/css/base/jellyfin/nord.css"));
-        assert!(patched.contains("jellium-series-compat.js"));
     }
 }
