@@ -11,9 +11,13 @@
     var MAX_CACHE_RESPONSE_BYTES = 4 * 1024 * 1024;
     var METADATA_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
     var VOLATILE_CACHE_MAX_AGE_MS = 15 * 60 * 1000;
+    var MAX_MEMORY_METADATA_ENTRIES = 256;
     var PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3];
     var debugLines = [];
     var cacheStats = { hits: 0, misses: 0, writes: 0 };
+    var memoryMetadataCache = new Map();
+    var metadataCacheLookups = new Map();
+    var metadataInFlight = new Map();
     var progressiveSubtitleSession = null;
     var progressiveSubtitleSequence = 0;
 
@@ -89,6 +93,9 @@
     }
 
     function debug(message) {
+        if (!isDebugEnabled()) {
+            return;
+        }
         var text = '[jellium-series] ' + message;
         debugLines.push(text);
         if (debugLines.length > MAX_DEBUG_LINES) {
@@ -240,20 +247,55 @@
         });
     }
 
-    function saveMetadataResponse(key, response) {
+    function metadataCacheEntryIsFresh(entry, request) {
+        if (!entry || typeof entry.body !== 'string') {
+            return false;
+        }
+        var age = Math.max(0, Date.now() - (Number(entry.updatedAt) || 0));
+        return age <= metadataCacheMaxAge(request);
+    }
+
+    function memoryMetadataCacheGet(key, request) {
+        var entry = memoryMetadataCache.get(key);
+        if (!entry) {
+            return null;
+        }
+        if (!metadataCacheEntryIsFresh(entry, request)) {
+            memoryMetadataCache.delete(key);
+            return null;
+        }
+        // Reinsert to approximate LRU without maintaining a second list.
+        memoryMetadataCache.delete(key);
+        memoryMetadataCache.set(key, entry);
+        return entry;
+    }
+
+    function memoryMetadataCachePut(key, entry) {
+        if (!entry || typeof entry.body !== 'string') {
+            return;
+        }
+        memoryMetadataCache.delete(key);
+        memoryMetadataCache.set(key, entry);
+        while (memoryMetadataCache.size > MAX_MEMORY_METADATA_ENTRIES) {
+            var oldestKey = memoryMetadataCache.keys().next().value;
+            memoryMetadataCache.delete(oldestKey);
+        }
+    }
+
+    function metadataEntryFromResponse(key, response) {
         if (!response || !response.ok) {
-            return Promise.resolve();
+            return Promise.resolve(null);
         }
         var contentType = response.headers.get('content-type') || '';
         if (!/json/i.test(contentType)) {
-            return Promise.resolve();
+            return Promise.resolve(null);
         }
         return response.clone().text().then(function (body) {
             if (body.length > MAX_CACHE_RESPONSE_BYTES) {
                 debug('跳过过大的元数据响应 bytes=' + body.length);
-                return;
+                return null;
             }
-            return cachePut({
+            return {
                 key: key,
                 body: body,
                 status: response.status,
@@ -263,11 +305,54 @@
                     'content-language': response.headers.get('content-language') || ''
                 },
                 updatedAt: Date.now()
-            }).catch(function (error) {
-                debug('缓存写入失败=' + (error && error.message || String(error)));
-            });
+            };
         }).catch(function () {
             // A response that cannot be cloned/read is still valid for the caller.
+            return null;
+        });
+    }
+
+    function startMetadataNetworkFetch(key, request, networkFetch, staleEntry) {
+        var responsePromise = networkFetch();
+        var entryPromise = responsePromise.then(function (response) {
+            if (!response.ok) {
+                return staleEntry || null;
+            }
+            return metadataEntryFromResponse(key, response).then(function (entry) {
+                if (!entry) {
+                    return null;
+                }
+                memoryMetadataCachePut(key, entry);
+                // The caller must not wait for disk persistence. The memory entry
+                // is enough to coalesce concurrent requests in this page load.
+                cachePut(entry).catch(function (error) {
+                    debug('缓存异步写入失败=' + (error && error.message || String(error)));
+                });
+                return entry;
+            }).catch(function () {
+                return null;
+            });
+        }).catch(function () {
+            return staleEntry || null;
+        });
+
+        metadataInFlight.set(key, entryPromise);
+        entryPromise.then(function () {
+            if (metadataInFlight.get(key) === entryPromise) {
+                metadataInFlight.delete(key);
+            }
+        });
+
+        return responsePromise.then(function (response) {
+            if (!response.ok && staleEntry) {
+                return responseFromCache(staleEntry);
+            }
+            return response;
+        }).catch(function (error) {
+            if (staleEntry) {
+                return responseFromCache(staleEntry);
+            }
+            throw error;
         });
     }
 
@@ -276,37 +361,74 @@
             return networkFetch();
         }
         var key = metadataCacheKey(request);
-        return cacheGet(key).then(function (entry) {
-            if (entry && typeof entry.body === 'string') {
-                var age = Math.max(0, Date.now() - (Number(entry.updatedAt) || 0));
-                if (age <= metadataCacheMaxAge(request)) {
+        var memoryEntry = memoryMetadataCacheGet(key, request);
+        if (memoryEntry) {
+            cacheStats.hits += 1;
+            debug('内存元数据缓存命中 ' + debugUrl(request.url));
+            return Promise.resolve(responseFromCache(memoryEntry));
+        }
+
+        var inFlight = metadataInFlight.get(key);
+        if (inFlight) {
+            return inFlight.then(function (entry) {
+                if (entry) {
                     cacheStats.hits += 1;
-                    debug('元数据缓存命中 ' + debugUrl(request.url));
+                    debug('合并重复元数据请求 ' + debugUrl(request.url));
                     return responseFromCache(entry);
                 }
-                debug('元数据缓存过期，重新拉取 ' + debugUrl(request.url));
-                return networkFetch().then(function (response) {
-                    if (!response.ok) {
+                return networkFetch();
+            });
+        }
+
+        var lookup = metadataCacheLookups.get(key);
+        if (!lookup) {
+            lookup = cacheGet(key);
+            metadataCacheLookups.set(key, lookup);
+            lookup.then(function () {
+                if (metadataCacheLookups.get(key) === lookup) {
+                    metadataCacheLookups.delete(key);
+                }
+            }, function () {
+                if (metadataCacheLookups.get(key) === lookup) {
+                    metadataCacheLookups.delete(key);
+                }
+            });
+        }
+
+        return lookup.then(function (entry) {
+            var cachedEntry = memoryMetadataCacheGet(key, request);
+            if (cachedEntry) {
+                cacheStats.hits += 1;
+                debug('内存元数据缓存命中 ' + debugUrl(request.url));
+                return responseFromCache(cachedEntry);
+            }
+
+            var pending = metadataInFlight.get(key);
+            if (pending) {
+                return pending.then(function (pendingEntry) {
+                    if (pendingEntry) {
                         cacheStats.hits += 1;
-                        debug('元数据刷新失败，使用旧缓存 ' + debugUrl(request.url));
-                        return responseFromCache(entry);
+                        debug('合并重复元数据请求 ' + debugUrl(request.url));
+                        return responseFromCache(pendingEntry);
                     }
-                    return saveMetadataResponse(key, response).then(function () {
-                        return response;
-                    });
-                }).catch(function () {
-                    cacheStats.hits += 1;
-                    debug('元数据刷新异常，使用旧缓存 ' + debugUrl(request.url));
-                    return responseFromCache(entry);
+                    return networkFetch();
                 });
             }
-            cacheStats.misses += 1;
-            debug('元数据缓存未命中 ' + debugUrl(request.url));
-            return networkFetch().then(function (response) {
-                return saveMetadataResponse(key, response).then(function () {
-                    return response;
-                });
-            });
+
+            if (metadataCacheEntryIsFresh(entry, request)) {
+                memoryMetadataCachePut(key, entry);
+                cacheStats.hits += 1;
+                debug('元数据缓存命中 ' + debugUrl(request.url));
+                return responseFromCache(entry);
+            }
+
+            if (entry && typeof entry.body === 'string') {
+                debug('元数据缓存过期，重新拉取 ' + debugUrl(request.url));
+            } else {
+                cacheStats.misses += 1;
+                debug('元数据缓存未命中 ' + debugUrl(request.url));
+            }
+            return startMetadataNetworkFetch(key, request, networkFetch, entry);
         }).catch(function (error) {
             debug('缓存读取失败=' + (error && error.message || String(error)) + '; 使用网络');
             return networkFetch();

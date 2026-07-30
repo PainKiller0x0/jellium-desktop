@@ -7,6 +7,7 @@ use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ico::IconDir;
 use percent_encoding::percent_decode_str;
@@ -29,7 +30,15 @@ struct ProxyState {
     root: PathBuf,
     upstream: String,
     local_url: String,
+    metadata_cache_root: PathBuf,
     agent: Agent,
+}
+
+enum MetadataCacheRoute {
+    Get(String),
+    Put,
+    Clear,
+    Count,
 }
 
 fn main() -> wry::Result<()> {
@@ -44,11 +53,13 @@ fn main() -> wry::Result<()> {
     let server = Server::http(format!("127.0.0.1:{LOCAL_PROXY_PORT}"))
         .expect("create local Jellyfin proxy on the stable port");
     let local_url = format!("http://127.0.0.1:{LOCAL_PROXY_PORT}");
+    let metadata_cache_root = metadata_cache_dir();
 
     let state = Arc::new(ProxyState {
         root,
         upstream,
         local_url: local_url.clone(),
+        metadata_cache_root,
         agent: ureq::agent(),
     });
     let server_state = state.clone();
@@ -94,11 +105,21 @@ fn main() -> wry::Result<()> {
 }
 
 fn webview_data_dir() -> PathBuf {
-    let base = env::var_os("LOCALAPPDATA")
+    let path = app_data_dir().join("webview2");
+    let _ = fs::create_dir_all(&path);
+    path
+}
+
+fn app_data_dir() -> PathBuf {
+    env::var_os("LOCALAPPDATA")
         .or_else(|| env::var_os("APPDATA"))
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let path = base.join("jellium-desktop").join("webview2");
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("jellium-desktop")
+}
+
+fn metadata_cache_dir() -> PathBuf {
+    let path = app_data_dir().join("jellium-cache");
     let _ = fs::create_dir_all(&path);
     path
 }
@@ -176,6 +197,10 @@ fn serve_request(request: TinyRequest, state: &ProxyState) {
 
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("/");
+    if let Some(route) = metadata_cache_route(request.method(), &url) {
+        serve_metadata_cache(request, &state.metadata_cache_root, route);
+        return;
+    }
     if let Some(relative) = safe_relative_path(path) {
         let candidate = state.root.join(&relative);
         if candidate.is_file() {
@@ -194,6 +219,120 @@ fn serve_request(request: TinyRequest, state: &ProxyState) {
         return;
     }
     proxy_request(request, state, &url);
+}
+
+fn metadata_cache_route(method: &TinyMethod, url: &str) -> Option<MetadataCacheRoute> {
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    if path != "/__jellium/metadata-cache" {
+        return None;
+    }
+
+    let action = query_param(query, "action")?;
+    match (method, action.as_str()) {
+        (&TinyMethod::Get, "get") => Some(MetadataCacheRoute::Get(query_param(query, "key")?)),
+        (&TinyMethod::Get, "count") => Some(MetadataCacheRoute::Count),
+        (&TinyMethod::Post, "put") => Some(MetadataCacheRoute::Put),
+        (&TinyMethod::Delete, "clear") => Some(MetadataCacheRoute::Clear),
+        _ => None,
+    }
+}
+
+fn serve_metadata_cache(
+    mut request: TinyRequest,
+    root: &Path,
+    route: MetadataCacheRoute,
+) {
+    match route {
+        MetadataCacheRoute::Get(key) => {
+            let path = metadata_cache_file(root, &key);
+            let Ok(bytes) = fs::read(path) else {
+                respond_bytes(request, 404, "application/json; charset=utf-8", b"{}".to_vec());
+                return;
+            };
+            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+                respond_bytes(request, 404, "application/json; charset=utf-8", b"{}".to_vec());
+                return;
+            };
+            if value.get("key").and_then(Value::as_str) != Some(key.as_str()) {
+                respond_bytes(request, 404, "application/json; charset=utf-8", b"{}".to_vec());
+                return;
+            }
+            respond_bytes(request, 200, "application/json; charset=utf-8", bytes);
+        }
+        MetadataCacheRoute::Put => {
+            let mut body = Vec::new();
+            if request.as_reader().read_to_end(&mut body).is_err() || body.len() > 8 * 1024 * 1024 {
+                respond_bytes(request, 400, "application/json; charset=utf-8", b"{}".to_vec());
+                return;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(&body) else {
+                respond_bytes(request, 400, "application/json; charset=utf-8", b"{}".to_vec());
+                return;
+            };
+            let Some(key) = value.get("key").and_then(Value::as_str) else {
+                respond_bytes(request, 400, "application/json; charset=utf-8", b"{}".to_vec());
+                return;
+            };
+            if value.get("body").and_then(Value::as_str).is_none() {
+                respond_bytes(request, 400, "application/json; charset=utf-8", b"{}".to_vec());
+                return;
+            }
+            let _ = fs::create_dir_all(root);
+            let path = metadata_cache_file(root, key);
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            let temporary = root.join(format!(".{:016x}.{}.tmp", metadata_cache_hash(key), stamp));
+            let persisted = fs::write(&temporary, &body).is_ok()
+                && (fs::rename(&temporary, &path).is_ok()
+                    || (fs::remove_file(&path).is_ok() && fs::rename(&temporary, &path).is_ok()));
+            if !persisted {
+                let _ = fs::remove_file(&temporary);
+                respond_bytes(request, 500, "application/json; charset=utf-8", b"{}".to_vec());
+                return;
+            }
+            respond_bytes(request, 204, "application/json; charset=utf-8", Vec::new());
+        }
+        MetadataCacheRoute::Clear => {
+            if let Ok(entries) = fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
+            respond_bytes(request, 204, "application/json; charset=utf-8", Vec::new());
+        }
+        MetadataCacheRoute::Count => {
+            let count = fs::read_dir(root)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|entry| {
+                            entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            let body = format!(r#"{{"count":{count}}}"#).into_bytes();
+            respond_bytes(request, 200, "application/json; charset=utf-8", body);
+        }
+    }
+}
+
+fn metadata_cache_hash(key: &str) -> u64 {
+    let mut hash = 14_695_981_039_346_656_037u64;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    hash
+}
+
+fn metadata_cache_file(root: &Path, key: &str) -> PathBuf {
+    root.join(format!("{:016x}.json", metadata_cache_hash(key)))
 }
 
 fn serve_static(
@@ -523,7 +662,7 @@ fn respond_bytes(request: TinyRequest, status: u16, mime: &str, bytes: Vec<u8>) 
 
 #[cfg(test)]
 mod tests {
-    use super::{patch_config, rewrite_children_url, safe_relative_path};
+    use super::{metadata_cache_route, patch_config, rewrite_children_url, safe_relative_path};
 
     #[test]
     fn config_points_the_web_client_at_the_same_origin_proxy() {
@@ -542,6 +681,30 @@ mod tests {
         let text = String::from_utf8(patched).unwrap();
         assert!(text.contains("jellium-series-compat.js"));
         assert!(text.contains("theme-park.dev/css/base/jellyfin/nord.css"));
+    }
+
+    #[test]
+    fn metadata_cache_routes_are_handled_by_the_local_proxy() {
+        assert!(metadata_cache_route(
+            &super::TinyMethod::Get,
+            "/__jellium/metadata-cache?action=get&key=v6%3Ahttps%3A%2F%2Fexample.test%2FItems%2F1"
+        )
+        .is_some());
+        assert!(metadata_cache_route(
+            &super::TinyMethod::Post,
+            "/__jellium/metadata-cache?action=put"
+        )
+        .is_some());
+        assert!(metadata_cache_route(
+            &super::TinyMethod::Delete,
+            "/__jellium/metadata-cache?action=clear"
+        )
+        .is_some());
+        assert!(metadata_cache_route(
+            &super::TinyMethod::Get,
+            "/__jellium/metadata-cache?action=count"
+        )
+        .is_some());
     }
 
     #[test]
