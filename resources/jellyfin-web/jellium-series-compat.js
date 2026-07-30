@@ -1275,6 +1275,24 @@
         });
     }
 
+    // The compatibility layer sometimes needs a second metadata request to
+    // fill in counts or episode overviews. Those requests used to go straight
+    // through nativeFetch, so they bypassed both the disk cache and the
+    // in-flight request coalescer. Reuse the same cache path here, while still
+    // keeping the original fetch function so this helper cannot recurse into
+    // the compatibility wrapper.
+    function supplementalMetadataFetch(nativeFetch, url, init) {
+        var request;
+        try {
+            request = new Request(url, init);
+        } catch (_) {
+            return nativeFetch(url, init);
+        }
+        return fetchWithMetadataCache(request, function () {
+            return nativeFetch(request);
+        });
+    }
+
     function isDirectShowSeasonsUrl(value) {
         var url;
         try {
@@ -1301,7 +1319,7 @@
             var episodesUrl = new URL(show.url.toString());
             episodesUrl.pathname = '/Shows/' + encodeURIComponent(show.seriesId) + '/Episodes';
             debug('direct seasons empty; fallback ' + debugUrl(episodesUrl));
-            return nativeFetch(episodesUrl.toString(), {
+            return supplementalMetadataFetch(nativeFetch, episodesUrl.toString(), {
                 method: 'GET',
                 headers: request.headers,
                 credentials: request.credentials,
@@ -1341,7 +1359,7 @@
                     '/Users/' + encodeURIComponent(list.userId) + '/Items/' + encodeURIComponent(parentId),
                     list.url.origin
                 );
-                return nativeFetch(parentUrl.toString(), {
+                return supplementalMetadataFetch(nativeFetch, parentUrl.toString(), {
                     method: 'GET',
                     headers: request.headers,
                     credentials: request.credentials,
@@ -1426,7 +1444,7 @@
                 ? '/Users/' + encodeURIComponent(userId) + '/Items/' + encodeURIComponent(seriesId)
                 : '/Items/' + encodeURIComponent(seriesId);
             var seriesUrl = new URL(seriesPath, url.origin);
-            return nativeFetch(seriesUrl.toString(), {
+            return supplementalMetadataFetch(nativeFetch, seriesUrl.toString(), {
                 method: 'GET',
                 headers: request.headers,
                 credentials: request.credentials,
@@ -1612,7 +1630,7 @@
                 );
                 episodesUrl.searchParams.set('Limit', '1');
                 debug('series counts missing; probe ' + debugUrl(episodesUrl));
-                countPromise = nativeFetch(episodesUrl.toString(), {
+                countPromise = supplementalMetadataFetch(nativeFetch, episodesUrl.toString(), {
                     method: 'GET',
                     headers: request.headers,
                     credentials: request.credentials,
@@ -1677,7 +1695,7 @@
                 // did not ask for the detail fields explicitly.
                 detailFieldsUrl.searchParams.set('jelliumDetailFields', '1');
                 overviewPromise = overviewPromise.then(function () {
-                    return nativeFetch(detailFieldsUrl.toString(), {
+                    return supplementalMetadataFetch(nativeFetch, detailFieldsUrl.toString(), {
                         method: 'GET',
                         headers: request.headers,
                         credentials: request.credentials,
@@ -1715,7 +1733,7 @@
                     : '/Items/' + encodeURIComponent(item.SeriesId);
                 var seriesUrl = detailRequestUrl(detail.url.origin, seriesPath, null);
                 overviewPromise = overviewPromise.then(function () {
-                    return nativeFetch(seriesUrl.toString(), {
+                    return supplementalMetadataFetch(nativeFetch, seriesUrl.toString(), {
                         method: 'GET',
                         headers: request.headers,
                         credentials: request.credentials,
