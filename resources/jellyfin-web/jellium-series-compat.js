@@ -973,7 +973,11 @@
                 // Never redirect a route the user has already left.
                 if (window.location.hash === rawHash) {
                     debug('redirect playable ' + item.Type + ' route id=' + String(itemId).slice(-8));
-                    window.location.hash = '#/details?id=' + encodeURIComponent(itemId);
+                    // The generated /movies or /tv route is only an intermediate
+                    // Jellyfin-Web link. Replace it instead of adding another
+                    // history entry, so Back returns to the library that the
+                    // user came from rather than revisiting the dead route.
+                    window.location.replace('#/details?id=' + encodeURIComponent(itemId));
                 }
             }
         }).catch(function (error) {
@@ -1007,26 +1011,14 @@
             event.preventDefault();
             event.stopImmediatePropagation();
             debug('intercept playable ' + type + ' click id=' + String(itemId).slice(-8));
-            window.location.hash = '#/details?id=' + encodeURIComponent(itemId);
+            // Do not leave the generated collection route in browser history.
+            // Otherwise Back lands on /movies?topParentId=... and the fallback
+            // redirect immediately opens this same detail page again.
+            window.location.replace('#/details?id=' + encodeURIComponent(itemId));
         }, true);
-
-        window.addEventListener('hashchange', function () {
-            window.setTimeout(redirectPlayableCollectionRoute, 0);
-        });
-        window.addEventListener('popstate', function () {
-            window.setTimeout(redirectPlayableCollectionRoute, 0);
-        });
-
-        // Jellyfin's router can update the URL with history.pushState(), which
-        // emits neither hashchange nor popstate. Keep a lightweight safety net
-        // for non-anchor/programmatic navigation.
-        var lastRouteHash = window.location.hash;
-        window.setInterval(function () {
-            if (window.location.hash !== lastRouteHash) {
-                lastRouteHash = window.location.hash;
-                redirectPlayableCollectionRoute();
-            }
-        }, 200);
+        // Only repair a collection route that was present when the app opened.
+        // Running this after every hash/popstate also catches the route produced
+        // by Back from a detail page and creates a redirect loop.
         window.setTimeout(redirectPlayableCollectionRoute, 0);
     }
 
