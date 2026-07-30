@@ -24,7 +24,7 @@ use wry::{WebContext, WebViewBuilder};
 
 const NORD_CSS_URL: &str = "https://theme-park.dev/css/base/jellyfin/nord.css";
 const LOCAL_PROXY_PORT: u16 = 39782;
-const FRONTEND_CACHE_BUSTER: &str = "series-compat-4";
+const FRONTEND_CACHE_BUSTER: &str = "series-compat-5";
 
 struct ProxyState {
     root: PathBuf,
