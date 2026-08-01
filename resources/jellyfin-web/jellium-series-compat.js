@@ -1912,6 +1912,41 @@
         }) || tracks[0] || null;
     }
 
+    function attachProgressiveSubtitleTrack(session, track) {
+        if (!session || !track || typeof track.addCue !== 'function') {
+            return;
+        }
+        if (session.attachedTrack !== track) {
+            session.attachedTrack = track;
+            session.attachedCueCount = 0;
+            debug('progressive subtitle track rebound cues=' + session.cues.length);
+        }
+        while (session.attachedCueCount < session.cues.length) {
+            var value = session.cues[session.attachedCueCount];
+            try {
+                var cueType = window.VTTCue || window.TextTrackCue;
+                if (!cueType) {
+                    return;
+                }
+                track.addCue(new cueType(value.start, value.end, value.text));
+                session.attachedCueCount += 1;
+            } catch (error) {
+                debug('progressive subtitle cue failed=' +
+                    (error && error.message || String(error)));
+                return;
+            }
+        }
+        if (session.cues.length) {
+            track.mode = 'showing';
+        }
+        if (!session.firstCueLogged && session.cues.length > 0) {
+            session.firstCueLogged = true;
+            debug('progressive subtitle first cue ready in ' +
+                Math.round(performance.now() - session.startedAt) + 'ms');
+        }
+        session.pending.length = 0;
+    }
+
     function addProgressiveSubtitleCue(session, block) {
         if (progressiveSubtitleSession !== session) {
             return;
@@ -1938,32 +1973,15 @@
         if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || !text) {
             return;
         }
-        var cueType = window.VTTCue || window.TextTrackCue;
-        if (!cueType) {
-            return;
-        }
+        var cue = { start: start, end: end, text: text };
+        session.cues.push(cue);
+        session.cueCount = session.cues.length;
         var track = currentManualSubtitleTrack();
         if (!track) {
-            session.pending.push({ start: start, end: end, text: text });
+            session.pending.push(cue);
             return;
         }
-        var pending = session.pending.splice(0);
-        pending.push({ start: start, end: end, text: text });
-        pending.forEach(function (value) {
-            try {
-                track.addCue(new cueType(value.start, value.end, value.text));
-                session.cueCount += 1;
-            } catch (error) {
-                debug('progressive subtitle cue failed=' +
-                    (error && error.message || String(error)));
-            }
-        });
-        track.mode = 'showing';
-        if (!session.firstCueLogged && session.cueCount > 0) {
-            session.firstCueLogged = true;
-            debug('progressive subtitle first cue ready in ' +
-                Math.round(performance.now() - session.startedAt) + 'ms');
-        }
+        attachProgressiveSubtitleTrack(session, track);
     }
 
     function feedProgressiveSubtitle(session, value, done) {
@@ -1977,12 +1995,8 @@
         blocks.forEach(function (block) {
             addProgressiveSubtitleCue(session, block);
         });
-        if (done && session.pending.length) {
-            var pending = session.pending.splice(0);
-            pending.forEach(function (cue) {
-                addProgressiveSubtitleCue(session,
-                    cue.start + ' --> ' + cue.end + '\n' + cue.text);
-            });
+        if (done) {
+            attachProgressiveSubtitleTrack(session, currentManualSubtitleTrack());
         }
     }
 
@@ -2016,7 +2030,7 @@
         var url = new URL(baseUrl);
         var ticks = Math.max(0, Math.floor((Number(startSeconds) || 0) * 10000000));
         url.pathname = url.pathname.replace(
-            /(\/Videos\/[^/]+\/[^/]+\/Subtitles\/\d+)(?:\/\d+)?\/Stream\.vtt$/i,
+            /(\/Videos\/[^/]+(?:\/[^/]+)?\/Subtitles\/\d+)(?:\/\d+)?\/Stream\.vtt$/i,
             function (_, prefix) {
                 return prefix + (ticks ? '/' + ticks : '') + '/Stream.vtt';
             }
@@ -2045,6 +2059,9 @@
         var runId = session.runId;
         session.buffer = '';
         session.pending = [];
+        session.cues = [];
+        session.attachedTrack = null;
+        session.attachedCueCount = 0;
         session.cueCount = 0;
         session.firstCueLogged = false;
         session.startedAt = performance.now();
@@ -2193,6 +2210,7 @@
             }
             bindProgressiveSubtitleVideo(session, video);
             var track = currentManualSubtitleTrack();
+            attachProgressiveSubtitleTrack(session, track);
             if (track && track.mode === 'disabled' && session.cueCount > 0 &&
                     !video.seeking && Date.now() - session.lastSeekAt > 3000) {
                 stopProgressiveSubtitle('subtitle disabled');
