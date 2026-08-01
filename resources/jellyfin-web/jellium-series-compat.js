@@ -24,6 +24,7 @@
     var apiEpisodeInFlight = new Map();
     var progressiveSubtitleSession = null;
     var progressiveSubtitleSequence = 0;
+    var PROGRESSIVE_SUBTITLE_WINDOW_SECONDS = 30;
 
     function getLocalSetting(key, fallback) {
         try {
@@ -1974,6 +1975,13 @@
             return;
         }
         var cue = { start: start, end: end, text: text };
+        var duplicate = session.cues.some(function (existing) {
+            return existing.start === cue.start &&
+                existing.end === cue.end && existing.text === cue.text;
+        });
+        if (duplicate) {
+            return;
+        }
         session.cues.push(cue);
         session.cueCount = session.cues.length;
         var track = currentManualSubtitleTrack();
@@ -2050,22 +2058,27 @@
         session.controller = null;
     }
 
-    function startProgressiveSubtitleStream(session, startSeconds, reason) {
+    function startProgressiveSubtitleStream(session, startSeconds, reason, append) {
         if (progressiveSubtitleSession !== session) {
             return;
         }
+        append = Boolean(append);
         abortProgressiveSubtitleStream(session);
         session.runId += 1;
         var runId = session.runId;
-        session.buffer = '';
-        session.pending = [];
-        session.cues = [];
-        session.attachedTrack = null;
-        session.attachedCueCount = 0;
-        session.cueCount = 0;
-        session.firstCueLogged = false;
+        if (!append) {
+            session.buffer = '';
+            session.pending = [];
+            session.cues = [];
+            session.attachedTrack = null;
+            session.attachedCueCount = 0;
+            session.cueCount = 0;
+            session.firstCueLogged = false;
+        }
         session.startedAt = performance.now();
         session.startSeconds = Math.max(0, Number(startSeconds) || 0);
+        session.loadedUntil = session.startSeconds + PROGRESSIVE_SUBTITLE_WINDOW_SECONDS;
+        session.loading = true;
         session.controller = new AbortController();
         var controller = session.controller;
         var track = currentManualSubtitleTrack();
@@ -2116,6 +2129,10 @@
                     progressiveSubtitleSession === session && session.runId === runId) {
                 debug('progressive subtitle failed=' +
                     (error && error.message || String(error)));
+            }
+        }).finally(function () {
+            if (progressiveSubtitleSession === session && session.runId === runId) {
+                session.loading = false;
             }
         });
     }
@@ -2195,7 +2212,9 @@
             video: null,
             seekedHandler: null,
             seekTimer: null,
-            lastSeekAt: 0
+            lastSeekAt: 0,
+            loadedUntil: 0,
+            loading: false
         };
         progressiveSubtitleSession = session;
         startProgressiveSubtitleStream(session, 0, 'selection');
@@ -2213,6 +2232,15 @@
             bindProgressiveSubtitleVideo(session, video);
             var track = currentManualSubtitleTrack();
             attachProgressiveSubtitleTrack(session, track);
+            if (!session.loading && !video.seeking &&
+                    Number(video.currentTime) >= session.loadedUntil - 8) {
+                startProgressiveSubtitleStream(
+                    session,
+                    Math.max(0, session.loadedUntil - 1),
+                    'advance',
+                    true
+                );
+            }
             if (track && track.mode === 'disabled' && session.cueCount > 0 &&
                     !video.seeking && Date.now() - session.lastSeekAt > 3000) {
                 stopProgressiveSubtitle('subtitle disabled');
