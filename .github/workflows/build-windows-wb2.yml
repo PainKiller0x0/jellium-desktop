@@ -20,6 +20,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
+      - name: Check Rust formatting
+        shell: pwsh
+        run: cargo fmt --manifest-path win-wb2/Cargo.toml -- --check
+
+      - name: Run Rust tests
+        shell: pwsh
+        run: cargo test --manifest-path win-wb2/Cargo.toml
+
+      - name: Run compatibility smoke test
+        shell: pwsh
+        run: node win-wb2/tests/compat-static.mjs
+
       - name: Build WebView2 prototype
         shell: pwsh
         env:

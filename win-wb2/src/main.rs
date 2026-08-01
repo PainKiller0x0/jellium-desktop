@@ -2,10 +2,10 @@
 
 use std::env;
 use std::fs;
-use std::io::Read;
 use std::io::Cursor;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,15 +16,16 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tao::window::{Icon, WindowBuilder};
 use tiny_http::{
-    Header, Method as TinyMethod, Request as TinyRequest, Response as TinyResponse,
-    Server, StatusCode as TinyStatusCode,
+    Header, Method as TinyMethod, Request as TinyRequest, Response as TinyResponse, Server,
+    StatusCode as TinyStatusCode,
 };
 use ureq::Agent;
 use wry::{WebContext, WebViewBuilder};
 
-const NORD_CSS_URL: &str = "https://theme-park.dev/css/base/jellyfin/nord.css";
+const NORD_CSS_PATH: &str = "jellium-nord.css";
 const LOCAL_PROXY_PORT: u16 = 39782;
-const FRONTEND_CACHE_BUSTER: &str = "series-compat-6";
+const FRONTEND_CACHE_BUSTER: &str = "series-compat-8";
+const PROXY_QUEUE_CAPACITY: usize = 64;
 
 struct ProxyState {
     root: PathBuf,
@@ -66,11 +67,30 @@ fn main() -> wry::Result<()> {
     thread::Builder::new()
         .name("jellium-local-proxy".into())
         .spawn(move || {
-            for request in server.incoming_requests() {
+            let (request_tx, request_rx) = mpsc::sync_channel(PROXY_QUEUE_CAPACITY);
+            let request_rx = Arc::new(Mutex::new(request_rx));
+            for worker_id in 0..proxy_worker_count() {
                 let state = server_state.clone();
+                let request_rx = Arc::clone(&request_rx);
                 let _ = thread::Builder::new()
-                    .name("jellium-proxy-request".into())
-                    .spawn(move || serve_request(request, &state));
+                    .name(format!("jellium-proxy-worker-{worker_id}"))
+                    .spawn(move || {
+                        loop {
+                            let request = match request_rx.lock() {
+                                Ok(receiver) => receiver.recv(),
+                                Err(_) => return,
+                            };
+                            let Ok(request) = request else {
+                                return;
+                            };
+                            serve_request(request, &state);
+                        }
+                    });
+            }
+            for request in server.incoming_requests() {
+                if request_tx.send(request).is_err() {
+                    return;
+                }
             }
         })
         .expect("start local proxy thread");
@@ -102,6 +122,12 @@ fn main() -> wry::Result<()> {
             }
         }
     });
+}
+
+fn proxy_worker_count() -> usize {
+    thread::available_parallelism()
+        .map(|parallelism| parallelism.get().clamp(4, 12))
+        .unwrap_or(8)
 }
 
 fn webview_data_dir() -> PathBuf {
@@ -237,24 +263,35 @@ fn metadata_cache_route(method: &TinyMethod, url: &str) -> Option<MetadataCacheR
     }
 }
 
-fn serve_metadata_cache(
-    mut request: TinyRequest,
-    root: &Path,
-    route: MetadataCacheRoute,
-) {
+fn serve_metadata_cache(mut request: TinyRequest, root: &Path, route: MetadataCacheRoute) {
     match route {
         MetadataCacheRoute::Get(key) => {
             let path = metadata_cache_file(root, &key);
             let Ok(bytes) = fs::read(path) else {
-                respond_bytes(request, 404, "application/json; charset=utf-8", b"{}".to_vec());
+                respond_bytes(
+                    request,
+                    404,
+                    "application/json; charset=utf-8",
+                    b"{}".to_vec(),
+                );
                 return;
             };
             let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-                respond_bytes(request, 404, "application/json; charset=utf-8", b"{}".to_vec());
+                respond_bytes(
+                    request,
+                    404,
+                    "application/json; charset=utf-8",
+                    b"{}".to_vec(),
+                );
                 return;
             };
             if value.get("key").and_then(Value::as_str) != Some(key.as_str()) {
-                respond_bytes(request, 404, "application/json; charset=utf-8", b"{}".to_vec());
+                respond_bytes(
+                    request,
+                    404,
+                    "application/json; charset=utf-8",
+                    b"{}".to_vec(),
+                );
                 return;
             }
             respond_bytes(request, 200, "application/json; charset=utf-8", bytes);
@@ -262,19 +299,39 @@ fn serve_metadata_cache(
         MetadataCacheRoute::Put => {
             let mut body = Vec::new();
             if request.as_reader().read_to_end(&mut body).is_err() || body.len() > 8 * 1024 * 1024 {
-                respond_bytes(request, 400, "application/json; charset=utf-8", b"{}".to_vec());
+                respond_bytes(
+                    request,
+                    400,
+                    "application/json; charset=utf-8",
+                    b"{}".to_vec(),
+                );
                 return;
             }
             let Ok(value) = serde_json::from_slice::<Value>(&body) else {
-                respond_bytes(request, 400, "application/json; charset=utf-8", b"{}".to_vec());
+                respond_bytes(
+                    request,
+                    400,
+                    "application/json; charset=utf-8",
+                    b"{}".to_vec(),
+                );
                 return;
             };
             let Some(key) = value.get("key").and_then(Value::as_str) else {
-                respond_bytes(request, 400, "application/json; charset=utf-8", b"{}".to_vec());
+                respond_bytes(
+                    request,
+                    400,
+                    "application/json; charset=utf-8",
+                    b"{}".to_vec(),
+                );
                 return;
             };
             if value.get("body").and_then(Value::as_str).is_none() {
-                respond_bytes(request, 400, "application/json; charset=utf-8", b"{}".to_vec());
+                respond_bytes(
+                    request,
+                    400,
+                    "application/json; charset=utf-8",
+                    b"{}".to_vec(),
+                );
                 return;
             }
             let _ = fs::create_dir_all(root);
@@ -289,7 +346,12 @@ fn serve_metadata_cache(
                     || (fs::remove_file(&path).is_ok() && fs::rename(&temporary, &path).is_ok()));
             if !persisted {
                 let _ = fs::remove_file(&temporary);
-                respond_bytes(request, 500, "application/json; charset=utf-8", b"{}".to_vec());
+                respond_bytes(
+                    request,
+                    500,
+                    "application/json; charset=utf-8",
+                    b"{}".to_vec(),
+                );
                 return;
             }
             respond_bytes(request, 204, "application/json; charset=utf-8", Vec::new());
@@ -335,16 +397,16 @@ fn metadata_cache_file(root: &Path, key: &str) -> PathBuf {
     root.join(format!("{:016x}.json", metadata_cache_hash(key)))
 }
 
-fn serve_static(
-    request: TinyRequest,
-    state: &ProxyState,
-    relative: &str,
-    path: &Path,
-) {
+fn serve_static(request: TinyRequest, state: &ProxyState, relative: &str, path: &Path) {
     let mut bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(_) => {
-            respond_bytes(request, 500, "text/plain; charset=utf-8", b"read failed".to_vec());
+            respond_bytes(
+                request,
+                500,
+                "text/plain; charset=utf-8",
+                b"read failed".to_vec(),
+            );
             return;
         }
     };
@@ -375,7 +437,9 @@ fn serve_static(
 
 fn proxy_request(mut request: TinyRequest, state: &ProxyState, url: &str) {
     let method = request.method().to_string();
-    let rewritten_url = if request.method() == &TinyMethod::Get {
+    let rewritten_url = if request.method() == &TinyMethod::Get
+        && !has_request_header(request.headers(), "X-Jellium-Series-Compat")
+    {
         rewrite_series_children_request(&state.agent, &state.upstream, url, request.headers())
             .unwrap_or_else(|| url.to_string())
     } else {
@@ -385,7 +449,12 @@ fn proxy_request(mut request: TinyRequest, state: &ProxyState, url: &str) {
     let mut body = Vec::new();
     if request.body_length().unwrap_or(0) > 0 {
         if request.as_reader().read_to_end(&mut body).is_err() {
-            respond_bytes(request, 400, "text/plain; charset=utf-8", b"bad request body".to_vec());
+            respond_bytes(
+                request,
+                400,
+                "text/plain; charset=utf-8",
+                b"bad request body".to_vec(),
+            );
             return;
         }
     }
@@ -422,10 +491,8 @@ fn proxy_request(mut request: TinyRequest, state: &ProxyState, url: &str) {
                 TinyResponse::new(TinyStatusCode(status), Vec::new(), reader, None, None);
             for (name, value) in &headers {
                 if should_forward_response_header(name.as_str())
-                    && let Ok(header) = Header::from_bytes(
-                        name.as_str().as_bytes(),
-                        value.as_bytes(),
-                    )
+                    && let Ok(header) =
+                        Header::from_bytes(name.as_str().as_bytes(), value.as_bytes())
                 {
                     response = response.with_header(header);
                 }
@@ -475,10 +542,7 @@ fn patch_config(mut bytes: Vec<u8>, local_url: &str) -> Vec<u8> {
 fn patch_min_version(mut bytes: Vec<u8>) -> Vec<u8> {
     let from = b"10.10.0";
     let to = b"4.8.0.0";
-    if let Some(start) = bytes
-        .windows(from.len())
-        .position(|window| window == from)
-    {
+    if let Some(start) = bytes.windows(from.len()).position(|window| window == from) {
         bytes[start..start + to.len()].copy_from_slice(to);
     }
     bytes
@@ -493,7 +557,7 @@ fn patch_index(mut bytes: Vec<u8>) -> Vec<u8> {
         return bytes;
     };
     let injected = format!(
-        r#"<script defer="defer" src="jellium-series-compat.js?v={FRONTEND_CACHE_BUSTER}"></script><link rel="preload" as="style" href="{NORD_CSS_URL}" onload="this.onload=null;this.rel='stylesheet'"><noscript><link rel="stylesheet" href="{NORD_CSS_URL}"></noscript>"#
+        r#"<script defer="defer" src="jellium-series-compat.js?v={FRONTEND_CACHE_BUSTER}"></script><link rel="preload" as="style" href="{NORD_CSS_PATH}?v={FRONTEND_CACHE_BUSTER}" onload="this.onload=null;this.rel='stylesheet'"><noscript><link rel="stylesheet" href="{NORD_CSS_PATH}?v={FRONTEND_CACHE_BUSTER}"></noscript>"#
     );
     bytes.splice(position..position, injected.into_bytes());
     bytes
@@ -506,7 +570,10 @@ fn rewrite_series_children_request(
     headers: &[Header],
 ) -> Option<String> {
     let (path, query) = url.split_once('?')?;
-    let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     if segments.len() != 3 || segments[0] != "Users" || segments[2] != "Items" {
         return None;
     }
@@ -514,10 +581,7 @@ fn rewrite_series_children_request(
         return None;
     }
     let parent_id = query_param(query, "ParentId")?;
-    let item_url = format!(
-        "{}/Users/{}/Items/{}",
-        upstream, segments[1], parent_id
-    );
+    let item_url = format!("{}/Users/{}/Items/{}", upstream, segments[1], parent_id);
     let parent = get_json_with_headers(agent, &item_url, headers)?;
     let item_type = parent.get("Type")?.as_str()?;
 
@@ -585,6 +649,13 @@ fn query_param(query: &str, wanted: &str) -> Option<String> {
     })
 }
 
+fn has_request_header(headers: &[Header], wanted: &str) -> bool {
+    headers.iter().any(|header| {
+        let name: &str = header.field.as_str().into();
+        name.eq_ignore_ascii_case(wanted)
+    })
+}
+
 fn get_json_with_headers(agent: &Agent, url: &str, headers: &[Header]) -> Option<Value> {
     let mut builder = ureq::http::Request::builder().method("GET").uri(url);
     for header in headers {
@@ -599,7 +670,11 @@ fn get_json_with_headers(agent: &Agent, url: &str, headers: &[Header]) -> Option
         return None;
     }
     let mut body = String::new();
-    response.into_body().into_reader().read_to_string(&mut body).ok()?;
+    response
+        .into_body()
+        .into_reader()
+        .read_to_string(&mut body)
+        .ok()?;
     serde_json::from_str(&body).ok()
 }
 
@@ -686,7 +761,11 @@ fn respond_static(
 
 #[cfg(test)]
 mod tests {
-    use super::{metadata_cache_route, patch_config, rewrite_children_url, safe_relative_path};
+    use super::{
+        PROXY_QUEUE_CAPACITY, has_request_header, metadata_cache_route, patch_config,
+        proxy_worker_count, rewrite_children_url, safe_relative_path,
+    };
+    use tiny_http::Header;
 
     #[test]
     fn config_points_the_web_client_at_the_same_origin_proxy() {
@@ -704,7 +783,9 @@ mod tests {
         let patched = super::patch_index(br#"<html><head></head></html>"#.to_vec());
         let text = String::from_utf8(patched).unwrap();
         assert!(text.contains("jellium-series-compat.js"));
-        assert!(text.contains("theme-park.dev/css/base/jellyfin/nord.css"));
+        assert!(text.contains("series-compat-8"));
+        assert!(text.contains("jellium-nord.css?v=series-compat-8"));
+        assert!(!text.contains("theme-park.dev"));
         assert!(text.contains("rel=\"preload\" as=\"style\""));
     }
 
@@ -715,21 +796,27 @@ mod tests {
             "/__jellium/metadata-cache?action=get&key=v6%3Ahttps%3A%2F%2Fexample.test%2FItems%2F1"
         )
         .is_some());
-        assert!(metadata_cache_route(
-            &super::TinyMethod::Post,
-            "/__jellium/metadata-cache?action=put"
-        )
-        .is_some());
-        assert!(metadata_cache_route(
-            &super::TinyMethod::Delete,
-            "/__jellium/metadata-cache?action=clear"
-        )
-        .is_some());
-        assert!(metadata_cache_route(
-            &super::TinyMethod::Get,
-            "/__jellium/metadata-cache?action=count"
-        )
-        .is_some());
+        assert!(
+            metadata_cache_route(
+                &super::TinyMethod::Post,
+                "/__jellium/metadata-cache?action=put"
+            )
+            .is_some()
+        );
+        assert!(
+            metadata_cache_route(
+                &super::TinyMethod::Delete,
+                "/__jellium/metadata-cache?action=clear"
+            )
+            .is_some()
+        );
+        assert!(
+            metadata_cache_route(
+                &super::TinyMethod::Get,
+                "/__jellium/metadata-cache?action=count"
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -759,6 +846,18 @@ mod tests {
             rewritten,
             "/Shows/series/Episodes?Fields=Name&userId=user&SeasonId=season"
         );
+    }
+
+    #[test]
+    fn compat_marker_prevents_duplicate_series_rewrite() {
+        let header = Header::from_bytes(b"X-Jellium-Series-Compat", b"1").unwrap();
+        assert!(has_request_header(&[header], "x-jellium-series-compat"));
+    }
+
+    #[test]
+    fn proxy_worker_pool_has_a_bounded_concurrency_window() {
+        assert!((4..=12).contains(&proxy_worker_count()));
+        assert!(PROXY_QUEUE_CAPACITY >= proxy_worker_count());
     }
 
     #[test]

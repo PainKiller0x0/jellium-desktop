@@ -11,6 +11,8 @@
     var MAX_CACHE_RESPONSE_BYTES = 4 * 1024 * 1024;
     var METADATA_CACHE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
     var VOLATILE_CACHE_MAX_AGE_MS = 15 * 60 * 1000;
+    var STALE_WHILE_REVALIDATE_STABLE_GRACE_MS = 2 * 60 * 60 * 1000;
+    var STALE_WHILE_REVALIDATE_VOLATILE_GRACE_MS = 30 * 60 * 1000;
     var MAX_MEMORY_METADATA_ENTRIES = 256;
     var PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3];
     var debugLines = [];
@@ -18,6 +20,8 @@
     var memoryMetadataCache = new Map();
     var metadataCacheLookups = new Map();
     var metadataInFlight = new Map();
+    var apiItemInFlight = new Map();
+    var apiEpisodeInFlight = new Map();
     var progressiveSubtitleSession = null;
     var progressiveSubtitleSequence = 0;
 
@@ -202,6 +206,10 @@
         if (/\/Shows\/NextUp$/i.test(url.pathname)) {
             url.searchParams.delete('NextUpDateCutoff');
         }
+        // Jellyfin can serialize the same query parameters in different
+        // orders depending on which client path created the request. Keep one
+        // persistent cache entry for the same logical metadata request.
+        url.searchParams.sort();
         return CACHE_VERSION + ':' + url.toString();
     }
 
@@ -289,6 +297,18 @@
         return age <= metadataCacheMaxAge(request);
     }
 
+    function metadataCacheEntryCanServeStale(entry, request) {
+        if (!entry || typeof entry.body !== 'string') {
+            return false;
+        }
+        var age = Math.max(0, Date.now() - (Number(entry.updatedAt) || 0));
+        var maxAge = metadataCacheMaxAge(request);
+        var grace = maxAge === VOLATILE_CACHE_MAX_AGE_MS
+            ? STALE_WHILE_REVALIDATE_VOLATILE_GRACE_MS
+            : STALE_WHILE_REVALIDATE_STABLE_GRACE_MS;
+        return age <= maxAge + grace;
+    }
+
     function memoryMetadataCacheGet(key, request) {
         var entry = memoryMetadataCache.get(key);
         if (!entry) {
@@ -314,6 +334,15 @@
             var oldestKey = memoryMetadataCache.keys().next().value;
             memoryMetadataCache.delete(oldestKey);
         }
+    }
+
+    function seriesCompatHeaders(headers) {
+        var result = new Headers(headers || {});
+        // Rust keeps a compatibility fallback for raw Jellyfin Web requests.
+        // Mark requests already rewritten here so the local proxy does not make
+        // the same parent lookup a second time.
+        result.set('X-Jellium-Series-Compat', '1');
+        return result;
     }
 
     function metadataEntryFromResponse(key, response) {
@@ -453,6 +482,17 @@
                 memoryMetadataCachePut(key, entry);
                 cacheStats.hits += 1;
                 debug('元数据缓存命中 ' + debugUrl(request.url));
+                return responseFromCache(entry);
+            }
+
+            if (metadataCacheEntryCanServeStale(entry, request)) {
+                memoryMetadataCachePut(key, entry);
+                cacheStats.hits += 1;
+                debug('元数据缓存过期，先返回旧内容并后台刷新 ' + debugUrl(request.url));
+                // Do not make navigation wait for a slow VPS when a recently
+                // expired response is still usable. The refresh is coalesced
+                // through metadataInFlight and updates both memory and disk.
+                startMetadataNetworkFetch(key, request, networkFetch, entry);
                 return responseFromCache(entry);
             }
 
@@ -1222,6 +1262,69 @@
         }
     }
 
+    function rememberedApiItem(itemId) {
+        if (!itemId) {
+            return null;
+        }
+        try {
+            var items = window.__jelliumSeriesCompatItems;
+            return items && items[itemId] || null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function coalescedApiItemRequest(client, userId, itemId, originalGetItem) {
+        var key = String(userId || '') + ':' + String(itemId || '');
+        var remembered = rememberedApiItem(itemId);
+        if (remembered && hasOverview(remembered)) {
+            return Promise.resolve(remembered);
+        }
+        var inFlight = apiItemInFlight.get(key);
+        if (inFlight) {
+            return inFlight;
+        }
+        var request = Promise.resolve().then(function () {
+            return originalGetItem.call(client, userId, itemId);
+        });
+        apiItemInFlight.set(key, request);
+        request.then(function () {
+            if (apiItemInFlight.get(key) === request) {
+                apiItemInFlight.delete(key);
+            }
+        }, function () {
+            if (apiItemInFlight.get(key) === request) {
+                apiItemInFlight.delete(key);
+            }
+        });
+        return request;
+    }
+
+    function coalescedApiEpisodeRequest(client, userId, seriesId, originalGetEpisodes) {
+        var key = String(userId || '') + ':' + String(seriesId || '');
+        var inFlight = apiEpisodeInFlight.get(key);
+        if (inFlight) {
+            return inFlight;
+        }
+        var request = Promise.resolve().then(function () {
+            return originalGetEpisodes.call(client, seriesId, {
+                userId: userId,
+                Limit: 1
+            });
+        });
+        apiEpisodeInFlight.set(key, request);
+        request.then(function () {
+            if (apiEpisodeInFlight.get(key) === request) {
+                apiEpisodeInFlight.delete(key);
+            }
+        }, function () {
+            if (apiEpisodeInFlight.get(key) === request) {
+                apiEpisodeInFlight.delete(key);
+            }
+        });
+        return request;
+    }
+
     function renderRememberedEpisodeOverview() {
         var itemId = currentDetailItemId();
         if (!itemId || !window.__jelliumSeriesCompatItems) {
@@ -1530,10 +1633,7 @@
             !isPositiveCount(item.ChildCount) &&
             item.Id
         ) {
-            tasks.push(originalGetEpisodes.call(client, item.Id, {
-                userId: userId,
-                Limit: 1
-            }).then(function (result) {
+            tasks.push(coalescedApiEpisodeRequest(client, userId, item.Id, originalGetEpisodes).then(function (result) {
                 var count = apiEpisodeCount(result);
                 if (count > 0) {
                     normalized = Object.assign({}, normalized, {
@@ -1554,7 +1654,7 @@
         }
 
         if (item.Type === 'Episode' && !hasOverview(item) && item.SeriesId) {
-            tasks.push(originalGetItem.call(client, userId, item.SeriesId).then(function (series) {
+            tasks.push(coalescedApiItemRequest(client, userId, item.SeriesId, originalGetItem).then(function (series) {
                 if (hasOverview(series)) {
                     normalized = Object.assign({}, normalized, {
                         Overview: series.Overview,
@@ -1589,7 +1689,7 @@
             return Promise.resolve(result);
         }
         return Promise.all(seriesIds.map(function (seriesId) {
-            return originalGetItem.call(client, userId, seriesId).then(function (series) {
+            return coalescedApiItemRequest(client, userId, seriesId, originalGetItem).then(function (series) {
                 if (!hasOverview(series)) {
                     return;
                 }
@@ -1705,38 +1805,40 @@
                 // Keep this request separate from an older cache entry whose key
                 // did not ask for the detail fields explicitly.
                 detailFieldsUrl.searchParams.set('jelliumDetailFields', '1');
-                overviewPromise = overviewPromise.then(function () {
-                    return supplementalMetadataFetch(nativeFetch, detailFieldsUrl.toString(), {
-                        method: 'GET',
-                        headers: request.headers,
-                        credentials: request.credentials,
-                        cache: 'no-store',
-                        signal: request.signal
-                    }).then(function (fieldsResponse) {
-                        if (!fieldsResponse.ok) {
-                            debug('detail fields refresh status=' + fieldsResponse.status);
+                var detailFieldsPromise = supplementalMetadataFetch(nativeFetch, detailFieldsUrl.toString(), {
+                    method: 'GET',
+                    headers: request.headers,
+                    credentials: request.credentials,
+                    cache: 'no-store',
+                    signal: request.signal
+                }).then(function (fieldsResponse) {
+                    if (!fieldsResponse.ok) {
+                        debug('detail fields refresh status=' + fieldsResponse.status);
+                        return;
+                    }
+                    return fieldsResponse.json().then(function (freshItem) {
+                        if (!freshItem || typeof freshItem !== 'object') {
                             return;
                         }
-                        return fieldsResponse.json().then(function (freshItem) {
-                            if (!freshItem || typeof freshItem !== 'object') {
-                                return;
-                            }
-                            Object.keys(freshItem).forEach(function (key) {
-                                if (freshItem[key] != null) {
-                                    item[key] = freshItem[key];
-                                }
-                            });
-                            if (hasOverview(freshItem)) {
-                                changed = true;
-                                debug('detail fields refreshed overview=yes id=' +
-                                    String(item.Id || detail.itemId).slice(-8));
+                        Object.keys(freshItem).forEach(function (key) {
+                            if (freshItem[key] != null) {
+                                item[key] = freshItem[key];
                             }
                         });
-                    }).catch(function (error) {
-                        debug('detail fields refresh failed=' +
-                            (error && error.message || String(error)));
+                        if (hasOverview(freshItem)) {
+                            changed = true;
+                            debug('detail fields refreshed overview=yes id=' +
+                                String(item.Id || detail.itemId).slice(-8));
+                        }
                     });
+                }).catch(function (error) {
+                    debug('detail fields refresh failed=' +
+                        (error && error.message || String(error)));
                 });
+                // The episode-count probe and the detail-fields refresh are
+                // independent. Run them together so a slow count request does
+                // not delay the overview that the detail page needs.
+                overviewPromise = Promise.all([countPromise, detailFieldsPromise]);
             }
             if (itemType === 'Episode' && !hasOverview(item) && item.SeriesId) {
                 var seriesPath = detail.userId
@@ -2171,7 +2273,7 @@
                         debug('child route ' + debugUrl(rewritten) + ' UserId=uppercase');
                         return nativeFetch(rewritten.toString(), {
                             method: 'GET',
-                            headers: request.headers,
+                            headers: seriesCompatHeaders(request.headers),
                             credentials: request.credentials,
                             signal: request.signal
                         }).then(function (childResponse) {
