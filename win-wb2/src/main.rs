@@ -829,7 +829,7 @@ mod tests {
             "Seasons",
             None,
         );
-        assert_eq!(rewritten, "/Shows/series/Seasons?Fields=Name&userId=user");
+        assert_eq!(rewritten, "/Shows/series/Seasons?Fields=Name&UserId=user");
     }
 
     #[test]
@@ -844,7 +844,7 @@ mod tests {
         );
         assert_eq!(
             rewritten,
-            "/Shows/series/Episodes?Fields=Name&userId=user&SeasonId=season"
+            "/Shows/series/Episodes?Fields=Name&UserId=user&SeasonId=season"
         );
     }
 
