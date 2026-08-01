@@ -2078,9 +2078,11 @@
         debug('progressive subtitle start reason=' + reason +
             ' offset=' + session.startSeconds.toFixed(3) + 's ' + debugUrl(vttUrl));
         var decoder = new TextDecoder('utf-8');
+        var subtitleHeaders = new Headers(session.headers);
+        subtitleHeaders.set('Accept', 'text/vtt');
         session.nativeFetch(vttUrl.toString(), {
             method: 'GET',
-            headers: session.headers,
+            headers: subtitleHeaders,
             credentials: session.credentials,
             cache: 'no-store',
             signal: controller.signal

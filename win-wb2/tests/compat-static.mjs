@@ -32,6 +32,7 @@ for (const marker of [
   'session.cues = []',
   'progressive subtitle track rebound',
   'function progressiveSubtitleUrlAt',
+  "subtitleHeaders.set('Accept', 'text/vtt')",
   'window.fetch = compatibleFetch',
   'X-Jellium-Series-Compat',
   'prototype.getEpisodes = function',
