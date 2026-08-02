@@ -25,6 +25,7 @@
     var progressiveSubtitleSession = null;
     var progressiveSubtitleSequence = 0;
     var PROGRESSIVE_SUBTITLE_WINDOW_SECONDS = 20;
+    var PROGRESSIVE_SUBTITLE_MIN_LEAD_SECONDS = 8;
 
     function getLocalSetting(key, fallback) {
         try {
@@ -2034,6 +2035,14 @@
         return { first: first, last: last };
     }
 
+    function progressiveSubtitlePrefetchLeadSeconds(video) {
+        var playbackRate = Math.max(1, Number(video && video.playbackRate) || 1);
+        return Math.max(
+            PROGRESSIVE_SUBTITLE_MIN_LEAD_SECONDS,
+            Math.min(18, playbackRate * 6)
+        );
+    }
+
     function progressiveSubtitleUrlAt(baseUrl, startSeconds) {
         var url = new URL(baseUrl);
         var ticks = Math.max(0, Math.floor((Number(startSeconds) || 0) * 10000000));
@@ -2237,11 +2246,21 @@
             bindProgressiveSubtitleVideo(session, video);
             var track = currentManualSubtitleTrack();
             attachProgressiveSubtitleTrack(session, track);
+            var currentTime = Number(video.currentTime) || 0;
+            var prefetchLead = progressiveSubtitlePrefetchLeadSeconds(video);
             if (!session.loading && !video.seeking &&
-                    Number(video.currentTime) >= session.loadedUntil - 8) {
+                    currentTime >= session.loadedUntil - prefetchLead) {
+                var nextStart = Math.max(
+                    0,
+                    Math.max(session.loadedUntil - 1, currentTime - 5)
+                );
+                debug('progressive subtitle advance current=' + currentTime.toFixed(3) +
+                    's rate=' + (Number(video.playbackRate) || 1).toFixed(2) +
+                    'x lead=' + prefetchLead.toFixed(3) +
+                    's start=' + nextStart.toFixed(3) + 's');
                 startProgressiveSubtitleStream(
                     session,
-                    Math.max(0, session.loadedUntil - 1),
+                    nextStart,
                     'advance',
                     true
                 );
