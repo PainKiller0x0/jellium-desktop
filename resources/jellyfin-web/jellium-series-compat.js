@@ -2086,8 +2086,32 @@
         }
         session.startedAt = performance.now();
         session.startSeconds = Math.max(0, Number(startSeconds) || 0);
-        session.loadedUntil = session.startSeconds + PROGRESSIVE_SUBTITLE_WINDOW_SECONDS;
+        var previousLoadedFrom = session.loadedFrom;
+        var previousLoadedUntil = session.loadedUntil;
+        var requestedUntil = session.startSeconds + PROGRESSIVE_SUBTITLE_WINDOW_SECONDS;
+        if (!append) {
+            session.loadedFrom = session.startSeconds;
+            session.loadedUntil = requestedUntil;
+        } else {
+            var previousFrom = Number(session.loadedFrom);
+            var previousUntil = Number(session.loadedUntil);
+            if (!isFinite(previousFrom)) {
+                previousFrom = session.startSeconds;
+            }
+            if (!isFinite(previousUntil)) {
+                previousUntil = 0;
+            }
+            session.loadedFrom = Math.min(
+                previousFrom,
+                session.startSeconds
+            );
+            session.loadedUntil = Math.max(
+                previousUntil,
+                requestedUntil
+            );
+        }
         session.loading = true;
+        var streamCompleted = false;
         session.controller = new AbortController();
         var controller = session.controller;
         var track = currentManualSubtitleTrack();
@@ -2121,6 +2145,7 @@
                         return reader.cancel();
                     }
                     if (part.done) {
+                        streamCompleted = true;
                         feedProgressiveSubtitle(session, decoder.decode(), true);
                         debug('progressive subtitle complete offset=' +
                             session.startSeconds.toFixed(3) + 's cues=' + session.cueCount);
@@ -2143,6 +2168,10 @@
             }
         }).finally(function () {
             if (progressiveSubtitleSession === session && session.runId === runId) {
+                if (!streamCompleted) {
+                    session.loadedFrom = previousLoadedFrom;
+                    session.loadedUntil = previousLoadedUntil;
+                }
                 session.loading = false;
             }
         });
@@ -2164,15 +2193,34 @@
                 if (progressiveSubtitleSession !== session || !session.video) {
                     return;
                 }
+                if (session.video.seeking) {
+                    return;
+                }
                 var target = Number(session.video.currentTime) || 0;
-                var range = progressiveSubtitleCueRange(currentManualSubtitleTrack());
-                var covered = range && target >= range.first - 2 && target <= range.last + 2;
+                var rate = Math.max(1, Number(session.video.playbackRate) || 1);
+                var prefetchLead = progressiveSubtitlePrefetchLeadSeconds(session.video);
+                var loadedFrom = Number(session.loadedFrom) || 0;
+                var loadedUntil = Number(session.loadedUntil) || 0;
+                var outside = target < loadedFrom - 2 || target > loadedUntil + 2;
+                var nearEnd = target >= loadedUntil - prefetchLead;
                 debug('progressive subtitle seek target=' + target.toFixed(3) +
-                    's range=' + (range ?
-                        range.first.toFixed(3) + '-' + range.last.toFixed(3) : 'empty') +
-                    ' covered=' + Boolean(covered));
-                if (!covered) {
-                    startProgressiveSubtitleStream(session, Math.max(0, target - 5), 'seek');
+                    's rate=' + rate.toFixed(2) + 'x loaded=' +
+                    loadedFrom.toFixed(3) + '-' + loadedUntil.toFixed(3) +
+                    's outside=' + Boolean(outside) + ' nearEnd=' + Boolean(nearEnd));
+                if (outside) {
+                    startProgressiveSubtitleStream(
+                        session,
+                        Math.max(0, target - 5),
+                        'seek',
+                        false
+                    );
+                } else if (nearEnd && !session.loading) {
+                    startProgressiveSubtitleStream(
+                        session,
+                        Math.max(0, Math.max(loadedUntil - 1, target - 5)),
+                        'seek-advance',
+                        true
+                    );
                 }
             }, 80);
         };
@@ -2227,6 +2275,7 @@
             seekedHandler: null,
             seekTimer: null,
             lastSeekAt: 0,
+            loadedFrom: 0,
             loadedUntil: 0,
             loading: false
         };
