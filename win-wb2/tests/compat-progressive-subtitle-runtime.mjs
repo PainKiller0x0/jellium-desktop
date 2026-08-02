@@ -193,7 +193,9 @@ context.window.__jelliumSubtitleTest.session().attachedCueCount = 0;
 await new Promise((resolve) => setTimeout(resolve, 700));
 assert.equal(track.cues.length, cueCountBeforeRebind, 'rebinding must not duplicate cues');
 
-for (const timer of timers) {
+for (const timer of Array.from(timers)) {
   window.clearInterval(timer);
 }
+assert.equal(timers.size, 0, 'runtime test timers must be cleaned up');
 console.log('Jellium progressive subtitle runtime test passed');
+process.exit(0);
