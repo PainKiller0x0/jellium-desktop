@@ -34,6 +34,7 @@ for (const marker of [
   'session.cues = []',
   'progressive subtitle track rebound',
   'function progressiveSubtitleUrlAt',
+  'subtitle passthrough',
   "subtitleHeaders.set('Accept', 'application/json')",
   'function progressiveSubtitlePrefetchLeadSeconds',
   'function maybeAdvanceProgressiveSubtitle',

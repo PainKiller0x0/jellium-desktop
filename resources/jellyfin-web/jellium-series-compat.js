@@ -2295,70 +2295,18 @@
 
     function progressiveSubtitleJsonResponse(request, nativeFetch) {
         stopProgressiveSubtitle('switch');
-
-        var jsonUrl = new URL(request.url);
-        jsonUrl.pathname = jsonUrl.pathname.replace(
-            /(\/Subtitles\/\d+)(?:\/\d+)?\/Stream\.js$/i,
-            '$1/Stream.js'
-        );
-        var session = {
-            id: ++progressiveSubtitleSequence,
-            runId: 0,
-            controller: null,
-            pending: [],
-            cueCount: 0,
-            firstCueLogged: false,
-            startedAt: performance.now(),
-            startSeconds: 0,
-            baseJsonUrl: jsonUrl.toString(),
-            nativeFetch: nativeFetch,
-            headers: new Headers(request.headers),
-            credentials: request.credentials,
-            monitor: null,
-            video: null,
-            seekedHandler: null,
-            seekTimer: null,
-            timeUpdateHandler: null,
-            lastSeekAt: 0,
-            createdAt: Date.now(),
-            loadedFrom: 0,
-            loadedUntil: 0,
-            loading: false
-        };
-        progressiveSubtitleSession = session;
-        startProgressiveSubtitleStream(session, 0, 'selection');
-
-        session.monitor = window.setInterval(function () {
-            if (progressiveSubtitleSession !== session) {
-                window.clearInterval(session.monitor);
-                return;
-            }
-            var video = document.querySelector('video.htmlvideoplayer, video');
-            if (!video) {
-                if (Date.now() - session.createdAt > PROGRESSIVE_SUBTITLE_PLAYER_WAIT_MS) {
-                    stopProgressiveSubtitle('player did not mount');
-                } else {
-                    debug('progressive subtitle waiting for video element');
-                }
-                return;
-            }
-            bindProgressiveSubtitleVideo(session, video);
-            var track = currentManualSubtitleTrack();
-            attachProgressiveSubtitleTrack(session, track);
-            maybeAdvanceProgressiveSubtitle(session, video);
-            if (track && track.mode === 'disabled' && session.cueCount > 0 &&
-                    !video.seeking && Date.now() - session.lastSeekAt > 3000) {
-                stopProgressiveSubtitle('subtitle disabled');
-            }
-        }, 500);
-
-        return Promise.resolve(new Response(
-            JSON.stringify({ TrackEvents: [] }),
-            {
-                status: 200,
-                headers: { 'Content-Type': 'application/json; charset=utf-8' }
-            }
-        ));
+        // Always preserve the real TrackEvents payload for Jellyfin Web.
+        // WebView2 identifies itself as Edge, so the official player may use
+        // its custom subtitle renderer instead of a native TextTrack. Returning
+        // an empty payload here makes that renderer conclude that the item has
+        // no subtitles at all. The server already returns the correct JSON;
+        // let the official renderer own cue creation, seeking, and playback
+        // rate handling.
+        debug('subtitle passthrough ' + debugUrl(request.url));
+        return Promise.resolve(nativeFetch(request)).then(function (response) {
+            debug('subtitle passthrough status=' + response.status);
+            return response;
+        });
     }
 
     function installFetchCompatibility() {

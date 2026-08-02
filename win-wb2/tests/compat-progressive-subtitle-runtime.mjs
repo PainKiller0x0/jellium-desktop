@@ -16,66 +16,43 @@ const instrumented = source.replace(
 `,
 );
 
-class FakeCue {
-  constructor(start, end, text) {
-    this.startTime = start;
-    this.endTime = end;
-    this.text = text;
-  }
-}
-
-class FakeMutationObserver {
-  constructor() {}
-  observe() {}
-  disconnect() {}
-}
-
-const listeners = new Map();
-const video = {
-  currentTime: 0,
-  playbackRate: 2,
-  seeking: false,
-  textTracks: [],
-  addEventListener(name, handler) {
-    listeners.set(name, handler);
-  },
-  removeEventListener(name) {
-    listeners.delete(name);
-  },
-};
-const track = {
-  label: 'manualTrack',
-  mode: 'disabled',
-  cues: [],
-  addCue(cue) {
-    this.cues.push(cue);
-  },
-  removeCue(cue) {
-    const index = this.cues.indexOf(cue);
-    if (index >= 0) this.cues.splice(index, 1);
-  },
-};
-video.textTracks.push(track);
-let activeVideo = null;
-
 const storage = new Map();
-storage.set('jellium-playback-rate', '2');
+const payload = {
+  TrackEvents: [
+    {
+      StartPositionTicks: 1_000_000,
+      EndPositionTicks: 3_000_000,
+      Text: 'hello subtitle',
+    },
+  ],
+};
+let subtitleRequests = 0;
+const nativeFetch = async (input) => {
+  subtitleRequests += 1;
+  assert.match(input.url || String(input), /\/Subtitles\/2\/Stream\.js$/);
+  return new Response(JSON.stringify(payload), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+};
+
 const document = {
-  documentElement: {
-    appendChild() {},
-  },
+  documentElement: { appendChild() {} },
   body: null,
-  querySelector(selector) {
-    if (selector === '.videoOsdBottom .buttons') {
-      return null;
-    }
-    return selector.includes('video') ? activeVideo : null;
-  },
-  querySelectorAll(selector) {
-    return selector.includes('video') && activeVideo ? [activeVideo] : [];
-  },
+  querySelector() { return null; },
+  querySelectorAll() { return []; },
   getElementById(id) {
-    return id === 'jellium-settings-modal' ? {} : null;
+    if (id === 'jellium-settings-modal') return null;
+    return {
+      checked: false,
+      disabled: false,
+      style: {},
+      parentElement: { insertBefore() {} },
+      nextSibling: null,
+      addEventListener() {},
+      setAttribute() {},
+      remove() {},
+    };
   },
   createElement() {
     return {
@@ -83,74 +60,26 @@ const document = {
       setAttribute() {},
       addEventListener() {},
       appendChild() {},
+      remove() {},
     };
   },
   addEventListener() {},
 };
 
-const timers = new Set();
 const window = {
   localStorage: {
-    getItem(key) {
-      return storage.get(key) ?? null;
-    },
-    setItem(key, value) {
-      storage.set(key, String(value));
-    },
+    getItem(key) { return storage.get(key) ?? null; },
+    setItem(key, value) { storage.set(key, String(value)); },
   },
   location: new URL('https://jellium.test/'),
-  VTTCue: FakeCue,
-  TextTrackCue: FakeCue,
-  MutationObserver: FakeMutationObserver,
   addEventListener() {},
   setTimeout,
   clearTimeout,
-  setInterval(callback, delay) {
-    const timer = setInterval(callback, delay);
-    timers.add(timer);
-    return timer;
-  },
-  clearInterval(timer) {
-    clearInterval(timer);
-    timers.delete(timer);
-  },
-  fetch() {
-    return Promise.resolve(new Response('', { status: 404 }));
-  },
-};
-
-let subtitleRequests = 0;
-const nativeFetch = async (input) => {
-  const url = String(input);
-  if (!url.includes('/Subtitles/2/')) {
-    return new Response('', { status: 404 });
-  }
-  subtitleRequests += 1;
-  assert.match(url, /Stream\.js/, 'subtitle windows should use Jellyfin TrackEvents JSON');
-  const ticks = Number((url.match(/Subtitles\/2\/(\d+)\/Stream\.js/) || [])[1] || 0);
-  const start = ticks / 10000000;
-  // Make the append window deliberately slow, then seek away while it is in
-  // flight. The stale response must be ignored after the session run changes.
-  if (start >= 29 && start < 30) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  return new Response(JSON.stringify({
-    TrackEvents: [
-      {
-        StartPositionTicks: Math.round((start + 1) * 10000000),
-        EndPositionTicks: Math.round((start + 3) * 10000000),
-        Text: `cue-${subtitleRequests}-a`,
-      },
-      {
-        StartPositionTicks: Math.round((start + 10) * 10000000),
-        EndPositionTicks: Math.round((start + 12) * 10000000),
-        Text: `cue-${subtitleRequests}-b`,
-      },
-    ],
-  }), {
-    status: 200,
-    headers: { 'Content-Type': 'application/json' },
-  });
+  setInterval,
+  clearInterval,
+  // The compatibility layer must preserve the actual server response for
+  // Jellyfin Web's native and custom subtitle renderers.
+  fetch: nativeFetch,
 };
 
 const context = {
@@ -165,7 +94,7 @@ const context = {
   AbortController,
   TextDecoder,
   TextEncoder,
-  MutationObserver: FakeMutationObserver,
+  MutationObserver: class { observe() {} disconnect() {} },
   Map,
   Set,
   Promise,
@@ -185,40 +114,16 @@ const context = {
 vm.runInNewContext(instrumented, context, { filename: scriptPath });
 
 const request = new Request(
-  'https://jellium.test/Videos/item/item/Subtitles/2/0/Stream.js',
+  'https://jellium.test/Videos/item/item/Subtitles/2/Stream.js',
 );
-context.window.__jelliumSubtitleTest.start(request, nativeFetch);
-// Stream.js can be requested before WebView2 mounts the actual media element.
-// The session must survive this gap and bind once the video appears.
-setTimeout(() => { activeVideo = video; }, 650);
-
-await new Promise((resolve) => setTimeout(resolve, 1200));
-assert.equal(subtitleRequests, 1, 'initial subtitle window should be fetched');
-assert.ok(track.cues.length > 0, 'initial subtitle cues should be attached');
-
-video.currentTime = 18;
-listeners.get('timeupdate')?.();
-await new Promise((resolve) => setTimeout(resolve, 20));
-assert.equal(subtitleRequests, 2, '2x playback should prefetch the next window');
-
-video.currentTime = 60;
-listeners.get('seeked')?.();
-await new Promise((resolve) => setTimeout(resolve, 700));
-assert.equal(subtitleRequests, 3, 'seek outside the loaded window should replace it');
-assert.ok(track.cues.length >= 2, 'the replacement subtitle window should append cues');
-assert.ok(
-  track.cues.every((cue) => cue.text.startsWith('cue-3-')),
-  'a stale append response must not survive a seek replacement',
+const response = await context.window.fetch(request);
+assert.equal(subtitleRequests, 1, 'the real subtitle response should be fetched once');
+assert.equal(response.status, 200);
+assert.deepEqual(await response.json(), payload, 'TrackEvents must reach Jellyfin Web');
+assert.equal(
+  context.window.__jelliumSubtitleTest.session(),
+  null,
+  'passthrough mode must not leave a stale progressive session running',
 );
-
-const cueCountBeforeRebind = track.cues.length;
-context.window.__jelliumSubtitleTest.session().attachedCueCount = 0;
-await new Promise((resolve) => setTimeout(resolve, 700));
-assert.equal(track.cues.length, cueCountBeforeRebind, 'rebinding must not duplicate cues');
-
-for (const timer of Array.from(timers)) {
-  window.clearInterval(timer);
-}
-assert.equal(timers.size, 0, 'runtime test timers must be cleaned up');
-console.log('Jellium progressive subtitle runtime test passed');
+console.log('Jellium subtitle passthrough regression test passed');
 process.exit(0);
