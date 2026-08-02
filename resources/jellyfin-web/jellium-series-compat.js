@@ -2055,6 +2055,31 @@
         return url;
     }
 
+    function maybeAdvanceProgressiveSubtitle(session, video) {
+        if (progressiveSubtitleSession !== session || !video || session.loading || video.seeking) {
+            return;
+        }
+        var currentTime = Number(video.currentTime) || 0;
+        var prefetchLead = progressiveSubtitlePrefetchLeadSeconds(video);
+        if (currentTime < session.loadedUntil - prefetchLead) {
+            return;
+        }
+        var nextStart = Math.max(
+            0,
+            Math.max(session.loadedUntil - 1, currentTime - 5)
+        );
+        debug('progressive subtitle advance current=' + currentTime.toFixed(3) +
+            's rate=' + (Number(video.playbackRate) || 1).toFixed(2) +
+            'x lead=' + prefetchLead.toFixed(3) +
+            's start=' + nextStart.toFixed(3) + 's');
+        startProgressiveSubtitleStream(
+            session,
+            nextStart,
+            'advance',
+            true
+        );
+    }
+
     function abortProgressiveSubtitleStream(session) {
         if (!session || !session.controller) {
             return;
@@ -2184,6 +2209,7 @@
         if (session.video && session.seekedHandler) {
             session.video.removeEventListener('seeking', session.seekedHandler);
             session.video.removeEventListener('seeked', session.seekedHandler);
+            session.video.removeEventListener('timeupdate', session.timeUpdateHandler);
         }
         session.video = video;
         session.seekedHandler = function () {
@@ -2224,8 +2250,12 @@
                 }
             }, 80);
         };
+        session.timeUpdateHandler = function () {
+            maybeAdvanceProgressiveSubtitle(session, video);
+        };
         video.addEventListener('seeking', session.seekedHandler);
         video.addEventListener('seeked', session.seekedHandler);
+        video.addEventListener('timeupdate', session.timeUpdateHandler);
     }
 
     function stopProgressiveSubtitle(reason) {
@@ -2241,6 +2271,7 @@
         if (session.video && session.seekedHandler) {
             session.video.removeEventListener('seeking', session.seekedHandler);
             session.video.removeEventListener('seeked', session.seekedHandler);
+            session.video.removeEventListener('timeupdate', session.timeUpdateHandler);
         }
         abortProgressiveSubtitleStream(session);
         if (reason) {
@@ -2274,6 +2305,7 @@
             video: null,
             seekedHandler: null,
             seekTimer: null,
+            timeUpdateHandler: null,
             lastSeekAt: 0,
             loadedFrom: 0,
             loadedUntil: 0,
@@ -2295,25 +2327,7 @@
             bindProgressiveSubtitleVideo(session, video);
             var track = currentManualSubtitleTrack();
             attachProgressiveSubtitleTrack(session, track);
-            var currentTime = Number(video.currentTime) || 0;
-            var prefetchLead = progressiveSubtitlePrefetchLeadSeconds(video);
-            if (!session.loading && !video.seeking &&
-                    currentTime >= session.loadedUntil - prefetchLead) {
-                var nextStart = Math.max(
-                    0,
-                    Math.max(session.loadedUntil - 1, currentTime - 5)
-                );
-                debug('progressive subtitle advance current=' + currentTime.toFixed(3) +
-                    's rate=' + (Number(video.playbackRate) || 1).toFixed(2) +
-                    'x lead=' + prefetchLead.toFixed(3) +
-                    's start=' + nextStart.toFixed(3) + 's');
-                startProgressiveSubtitleStream(
-                    session,
-                    nextStart,
-                    'advance',
-                    true
-                );
-            }
+            maybeAdvanceProgressiveSubtitle(session, video);
             if (track && track.mode === 'disabled' && session.cueCount > 0 &&
                     !video.seeking && Date.now() - session.lastSeekAt > 3000) {
                 stopProgressiveSubtitle('subtitle disabled');

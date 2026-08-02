@@ -32,6 +32,10 @@ jobs:
         shell: pwsh
         run: node win-wb2/tests/compat-static.mjs
 
+      - name: Run subtitle runtime regression test
+        shell: pwsh
+        run: node win-wb2/tests/compat-progressive-subtitle-runtime.mjs
+
       - name: Build WebView2 prototype
         shell: pwsh
         env:
