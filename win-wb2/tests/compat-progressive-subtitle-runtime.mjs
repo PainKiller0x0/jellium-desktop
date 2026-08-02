@@ -188,6 +188,10 @@ listeners.get('timeupdate')?.();
 await new Promise((resolve) => setTimeout(resolve, 700));
 assert.equal(subtitleRequests, 2, '2x playback should prefetch the next window');
 assert.ok(track.cues.length > 2, 'next subtitle window should append cues');
+const cueCountBeforeRebind = track.cues.length;
+context.window.__jelliumSubtitleTest.session().attachedCueCount = 0;
+await new Promise((resolve) => setTimeout(resolve, 700));
+assert.equal(track.cues.length, cueCountBeforeRebind, 'rebinding must not duplicate cues');
 
 for (const timer of timers) {
   window.clearInterval(timer);

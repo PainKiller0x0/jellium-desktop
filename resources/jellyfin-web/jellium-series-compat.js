@@ -1930,7 +1930,17 @@
                 if (!cueType) {
                     return;
                 }
-                track.addCue(new cueType(value.start, value.end, value.text));
+                var duplicate = track.cues && Array.prototype.some.call(
+                    track.cues,
+                    function (existing) {
+                        return Number(existing.startTime) === value.start &&
+                            Number(existing.endTime) === value.end &&
+                            String(existing.text || '') === value.text;
+                    }
+                );
+                if (!duplicate) {
+                    track.addCue(new cueType(value.start, value.end, value.text));
+                }
                 session.attachedCueCount += 1;
             } catch (error) {
                 debug('progressive subtitle cue failed=' +
@@ -2274,6 +2284,12 @@
             session.video.removeEventListener('timeupdate', session.timeUpdateHandler);
         }
         abortProgressiveSubtitleStream(session);
+        if (session.attachedTrack) {
+            clearProgressiveSubtitleCues(session.attachedTrack);
+            if (reason !== 'subtitle disabled') {
+                session.attachedTrack.mode = 'disabled';
+            }
+        }
         if (reason) {
             debug('progressive subtitle stopped=' + reason +
                 ' cues=' + session.cueCount);

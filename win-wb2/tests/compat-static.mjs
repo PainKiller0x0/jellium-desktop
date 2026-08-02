@@ -29,6 +29,8 @@ for (const marker of [
   'function coalescedApiItemRequest',
   'function coalescedApiEpisodeRequest',
   'function attachProgressiveSubtitleTrack',
+  'Array.prototype.some.call',
+  'session.attachedTrack.mode = \'disabled\'',
   'session.cues = []',
   'progressive subtitle track rebound',
   'function progressiveSubtitleUrlAt',
