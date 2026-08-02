@@ -29,6 +29,10 @@
     // window so the client does not repeatedly request the same boundary.
     var PROGRESSIVE_SUBTITLE_WINDOW_SECONDS = 30;
     var PROGRESSIVE_SUBTITLE_MIN_LEAD_SECONDS = 8;
+    // Jellyfin can request Stream.js before the HTML5 video element and its
+    // TextTrack have been mounted. Do not tear down the session during that
+    // normal startup gap; wait long enough for slow WebView2 playback setup.
+    var PROGRESSIVE_SUBTITLE_PLAYER_WAIT_MS = 15000;
 
     function getLocalSetting(key, fallback) {
         try {
@@ -1899,9 +1903,25 @@
             return null;
         }
         var tracks = Array.prototype.slice.call(video.textTracks);
-        return tracks.find(function (track) {
+        var manualTrack = tracks.find(function (track) {
             return String(track.label || '').indexOf('manualTrack') !== -1;
-        }) || tracks[0] || null;
+        });
+        if (manualTrack) {
+            return manualTrack;
+        }
+        // The compatibility fetch intentionally returns an empty TrackEvents
+        // payload to the official renderer. Some Jellyfin versions therefore
+        // do not create a TextTrack at all. Create the same kind of manual
+        // track here so the bounded window cues still have a render target.
+        if (typeof video.addTextTrack === 'function') {
+            try {
+                return video.addTextTrack('subtitles', 'manualTrack', '');
+            } catch (_) {
+                // Fall through to an existing track if the browser disallows
+                // creating a track at this point in its lifecycle.
+            }
+        }
+        return tracks[0] || null;
     }
 
     function attachProgressiveSubtitleTrack(session, track) {
@@ -2138,7 +2158,23 @@
             if (!response.ok) {
                 throw new Error('subtitle stream status=' + response.status);
             }
-            return response.json();
+            return response.text().then(function (body) {
+                // Some Jellyfin-compatible servers return an empty successful
+                // response when the requested window contains no cue. Treat
+                // that as an empty TrackEvents payload instead of retrying
+                // the same window forever on Response.json().
+                if (!body || !body.trim()) {
+                    debug('progressive subtitle empty response offset=' +
+                        session.startSeconds.toFixed(3) + 's');
+                    return { TrackEvents: [] };
+                }
+                try {
+                    return JSON.parse(body);
+                } catch (error) {
+                    throw new Error('subtitle stream invalid JSON: ' +
+                        (error && error.message || String(error)));
+                }
+            });
         }).then(function (data) {
             if (progressiveSubtitleSession !== session || session.runId !== runId) {
                 return;
@@ -2284,6 +2320,7 @@
             seekTimer: null,
             timeUpdateHandler: null,
             lastSeekAt: 0,
+            createdAt: Date.now(),
             loadedFrom: 0,
             loadedUntil: 0,
             loading: false
@@ -2298,7 +2335,11 @@
             }
             var video = document.querySelector('video.htmlvideoplayer, video');
             if (!video) {
-                stopProgressiveSubtitle('player closed');
+                if (Date.now() - session.createdAt > PROGRESSIVE_SUBTITLE_PLAYER_WAIT_MS) {
+                    stopProgressiveSubtitle('player did not mount');
+                } else {
+                    debug('progressive subtitle waiting for video element');
+                }
                 return;
             }
             bindProgressiveSubtitleVideo(session, video);

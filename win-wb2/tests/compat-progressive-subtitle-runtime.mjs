@@ -56,6 +56,7 @@ const track = {
   },
 };
 video.textTracks.push(track);
+let activeVideo = null;
 
 const storage = new Map();
 storage.set('jellium-playback-rate', '2');
@@ -68,10 +69,10 @@ const document = {
     if (selector === '.videoOsdBottom .buttons') {
       return null;
     }
-    return selector.includes('video') ? video : null;
+    return selector.includes('video') ? activeVideo : null;
   },
   querySelectorAll(selector) {
-    return selector.includes('video') ? [video] : [];
+    return selector.includes('video') && activeVideo ? [activeVideo] : [];
   },
   getElementById(id) {
     return id === 'jellium-settings-modal' ? {} : null;
@@ -187,8 +188,11 @@ const request = new Request(
   'https://jellium.test/Videos/item/item/Subtitles/2/0/Stream.js',
 );
 context.window.__jelliumSubtitleTest.start(request, nativeFetch);
+// Stream.js can be requested before WebView2 mounts the actual media element.
+// The session must survive this gap and bind once the video appears.
+setTimeout(() => { activeVideo = video; }, 650);
 
-await new Promise((resolve) => setTimeout(resolve, 700));
+await new Promise((resolve) => setTimeout(resolve, 1200));
 assert.equal(subtitleRequests, 1, 'initial subtitle window should be fetched');
 assert.ok(track.cues.length > 0, 'initial subtitle cues should be attached');
 

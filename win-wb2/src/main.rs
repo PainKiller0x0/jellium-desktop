@@ -27,7 +27,7 @@ const LOCAL_PROXY_PORT: u16 = 39782;
 // Bump whenever the bundled compatibility layer changes. WebView2 keeps a
 // persistent HTTP cache between launches, so reusing this query value can
 // silently load an older script even when the executable contains new code.
-const FRONTEND_CACHE_BUSTER: &str = "series-compat-18";
+const FRONTEND_CACHE_BUSTER: &str = "series-compat-19";
 const PROXY_QUEUE_CAPACITY: usize = 64;
 
 struct ProxyState {
