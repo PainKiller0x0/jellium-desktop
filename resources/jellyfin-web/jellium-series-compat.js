@@ -24,7 +24,7 @@
     var apiEpisodeInFlight = new Map();
     var progressiveSubtitleSession = null;
     var progressiveSubtitleSequence = 0;
-    var PROGRESSIVE_SUBTITLE_WINDOW_SECONDS = 30;
+    var PROGRESSIVE_SUBTITLE_WINDOW_SECONDS = 20;
 
     function getLocalSetting(key, fallback) {
         try {
@@ -2163,7 +2163,7 @@
                         range.first.toFixed(3) + '-' + range.last.toFixed(3) : 'empty') +
                     ' covered=' + Boolean(covered));
                 if (!covered) {
-                    startProgressiveSubtitleStream(session, Math.max(0, target - 15), 'seek');
+                    startProgressiveSubtitleStream(session, Math.max(0, target - 5), 'seek');
                 }
             }, 80);
         };
