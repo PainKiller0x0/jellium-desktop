@@ -125,21 +125,30 @@ const nativeFetch = async (input) => {
     return new Response('', { status: 404 });
   }
   subtitleRequests += 1;
-  const ticks = Number((url.match(/Subtitles\/2\/(\d+)\/Stream\.vtt/) || [])[1] || 0);
+  assert.match(url, /Stream\.js/, 'subtitle windows should use Jellyfin TrackEvents JSON');
+  const ticks = Number((url.match(/Subtitles\/2\/(\d+)\/Stream\.js/) || [])[1] || 0);
   const start = ticks / 10000000;
-  const vtt = [
-    'WEBVTT',
-    '',
-    `${(start + 1).toFixed(3)} --> ${(start + 3).toFixed(3)}`,
-    `cue-${subtitleRequests}-a`,
-    '',
-    `${(start + 10).toFixed(3)} --> ${(start + 12).toFixed(3)}`,
-    `cue-${subtitleRequests}-b`,
-    '',
-  ].join('\n');
-  return new Response(vtt, {
+  // Make the append window deliberately slow, then seek away while it is in
+  // flight. The stale response must be ignored after the session run changes.
+  if (start >= 29 && start < 30) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return new Response(JSON.stringify({
+    TrackEvents: [
+      {
+        StartPositionTicks: Math.round((start + 1) * 10000000),
+        EndPositionTicks: Math.round((start + 3) * 10000000),
+        Text: `cue-${subtitleRequests}-a`,
+      },
+      {
+        StartPositionTicks: Math.round((start + 10) * 10000000),
+        EndPositionTicks: Math.round((start + 12) * 10000000),
+        Text: `cue-${subtitleRequests}-b`,
+      },
+    ],
+  }), {
     status: 200,
-    headers: { 'Content-Type': 'text/vtt' },
+    headers: { 'Content-Type': 'application/json' },
   });
 };
 
@@ -183,11 +192,21 @@ await new Promise((resolve) => setTimeout(resolve, 700));
 assert.equal(subtitleRequests, 1, 'initial subtitle window should be fetched');
 assert.ok(track.cues.length > 0, 'initial subtitle cues should be attached');
 
-video.currentTime = 8;
+video.currentTime = 18;
 listeners.get('timeupdate')?.();
-await new Promise((resolve) => setTimeout(resolve, 700));
+await new Promise((resolve) => setTimeout(resolve, 20));
 assert.equal(subtitleRequests, 2, '2x playback should prefetch the next window');
-assert.ok(track.cues.length > 2, 'next subtitle window should append cues');
+
+video.currentTime = 60;
+listeners.get('seeked')?.();
+await new Promise((resolve) => setTimeout(resolve, 700));
+assert.equal(subtitleRequests, 3, 'seek outside the loaded window should replace it');
+assert.ok(track.cues.length >= 2, 'the replacement subtitle window should append cues');
+assert.ok(
+  track.cues.every((cue) => cue.text.startsWith('cue-3-')),
+  'a stale append response must not survive a seek replacement',
+);
+
 const cueCountBeforeRebind = track.cues.length;
 context.window.__jelliumSubtitleTest.session().attachedCueCount = 0;
 await new Promise((resolve) => setTimeout(resolve, 700));

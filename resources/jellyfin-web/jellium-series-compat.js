@@ -24,7 +24,10 @@
     var apiEpisodeInFlight = new Map();
     var progressiveSubtitleSession = null;
     var progressiveSubtitleSequence = 0;
-    var PROGRESSIVE_SUBTITLE_WINDOW_SECONDS = 20;
+    // jellyfin-rs returns a bounded TrackEvents JSON window for Stream.js.
+    // Keep the client window aligned with the server's 30-second extraction
+    // window so the client does not repeatedly request the same boundary.
+    var PROGRESSIVE_SUBTITLE_WINDOW_SECONDS = 30;
     var PROGRESSIVE_SUBTITLE_MIN_LEAD_SECONDS = 8;
 
     function getLocalSetting(key, fallback) {
@@ -1890,19 +1893,6 @@
         }
     }
 
-    function subtitleTimestampSeconds(value) {
-        var parts = String(value || '').replace(',', '.').split(':');
-        if (parts.length === 3) {
-            return (parseFloat(parts[0]) * 3600) +
-                (parseFloat(parts[1]) * 60) +
-                parseFloat(parts[2]);
-        }
-        if (parts.length === 2) {
-            return (parseFloat(parts[0]) * 60) + parseFloat(parts[1]);
-        }
-        return parseFloat(parts[0]);
-    }
-
     function currentManualSubtitleTrack() {
         var video = document.querySelector('video.htmlvideoplayer, video');
         if (!video || !video.textTracks) {
@@ -1923,8 +1913,11 @@
             session.attachedCueCount = 0;
             debug('progressive subtitle track rebound cues=' + session.cues.length);
         }
-        while (session.attachedCueCount < session.cues.length) {
-            var value = session.cues[session.attachedCueCount];
+        // Do not rely on array position here. A seek/append response can finish
+        // after a previous window, and the official player may recreate the
+        // manual TextTrack while the session is still alive. Reconcile by cue
+        // identity just like the official renderer's replace-and-readd model.
+        session.cues.forEach(function (value) {
             try {
                 var cueType = window.VTTCue || window.TextTrackCue;
                 if (!cueType) {
@@ -1941,13 +1934,12 @@
                 if (!duplicate) {
                     track.addCue(new cueType(value.start, value.end, value.text));
                 }
-                session.attachedCueCount += 1;
             } catch (error) {
                 debug('progressive subtitle cue failed=' +
                     (error && error.message || String(error)));
-                return;
             }
-        }
+        });
+        session.attachedCueCount = session.cues.length;
         if (session.cues.length) {
             track.mode = 'showing';
         }
@@ -1959,33 +1951,25 @@
         session.pending.length = 0;
     }
 
-    function addProgressiveSubtitleCue(session, block) {
+    function addProgressiveSubtitleEvent(session, event) {
         if (progressiveSubtitleSession !== session) {
             return;
         }
-        var lines = String(block || '').replace(/\r/g, '').trim().split('\n');
-        if (!lines.length || /^(WEBVTT|NOTE|STYLE|REGION)(?:\s|$)/i.test(lines[0])) {
+        if (!event || typeof event !== 'object') {
             return;
         }
-        var timingIndex = lines.findIndex(function (line) {
-            return line.indexOf('-->') !== -1;
-        });
-        if (timingIndex < 0) {
+        var startTicks = Number(event.StartPositionTicks);
+        var endTicks = Number(event.EndPositionTicks);
+        var text = String(event.Text || '');
+        if (!Number.isFinite(startTicks) || !Number.isFinite(endTicks) ||
+                endTicks <= startTicks || !text) {
             return;
         }
-        var timing = lines[timingIndex].match(
-            /^\s*(\S+)\s+-->\s+(\S+)(?:\s+.*)?$/
-        );
-        if (!timing) {
-            return;
-        }
-        var start = subtitleTimestampSeconds(timing[1]);
-        var end = subtitleTimestampSeconds(timing[2]);
-        var text = lines.slice(timingIndex + 1).join('\n');
-        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || !text) {
-            return;
-        }
-        var cue = { start: start, end: end, text: text };
+        var cue = {
+            start: startTicks / 10000000,
+            end: endTicks / 10000000,
+            text: text
+        };
         var duplicate = session.cues.some(function (existing) {
             return existing.start === cue.start &&
                 existing.end === cue.end && existing.text === cue.text;
@@ -2003,20 +1987,17 @@
         attachProgressiveSubtitleTrack(session, track);
     }
 
-    function feedProgressiveSubtitle(session, value, done) {
-        session.buffer += value.replace(/\r/g, '');
-        var blocks = session.buffer.split(/\n{2,}/);
-        if (!done) {
-            session.buffer = blocks.pop() || '';
-        } else {
-            session.buffer = '';
+    function addProgressiveSubtitleEvents(session, data) {
+        if (!data || !Array.isArray(data.TrackEvents)) {
+            return;
         }
-        blocks.forEach(function (block) {
-            addProgressiveSubtitleCue(session, block);
+        data.TrackEvents.forEach(function (event) {
+            addProgressiveSubtitleEvent(session, event);
         });
-        if (done) {
-            attachProgressiveSubtitleTrack(session, currentManualSubtitleTrack());
-        }
+        // The official Jellyfin renderer attaches all TrackEvents after the
+        // JSON request resolves. Reconcile once more after the batch so a
+        // track created during the request receives every cue.
+        attachProgressiveSubtitleTrack(session, currentManualSubtitleTrack());
     }
 
     function clearProgressiveSubtitleCues(track) {
@@ -2057,9 +2038,9 @@
         var url = new URL(baseUrl);
         var ticks = Math.max(0, Math.floor((Number(startSeconds) || 0) * 10000000));
         url.pathname = url.pathname.replace(
-            /(\/Videos\/[^/]+(?:\/[^/]+)?\/Subtitles\/\d+)(?:\/\d+)?\/Stream\.vtt$/i,
+            /(\/Videos\/[^/]+(?:\/[^/]+)?\/Subtitles\/\d+)(?:\/\d+)?\/Stream\.js$/i,
             function (_, prefix) {
-                return prefix + (ticks ? '/' + ticks : '') + '/Stream.vtt';
+                return prefix + (ticks ? '/' + ticks : '') + '/Stream.js';
             }
         );
         return url;
@@ -2111,7 +2092,6 @@
         session.runId += 1;
         var runId = session.runId;
         if (!append) {
-            session.buffer = '';
             session.pending = [];
             session.cues = [];
             session.attachedTrack = null;
@@ -2126,24 +2106,10 @@
         var requestedUntil = session.startSeconds + PROGRESSIVE_SUBTITLE_WINDOW_SECONDS;
         if (!append) {
             session.loadedFrom = session.startSeconds;
-            session.loadedUntil = requestedUntil;
-        } else {
-            var previousFrom = Number(session.loadedFrom);
-            var previousUntil = Number(session.loadedUntil);
-            if (!isFinite(previousFrom)) {
-                previousFrom = session.startSeconds;
-            }
-            if (!isFinite(previousUntil)) {
-                previousUntil = 0;
-            }
-            session.loadedFrom = Math.min(
-                previousFrom,
-                session.startSeconds
-            );
-            session.loadedUntil = Math.max(
-                previousUntil,
-                requestedUntil
-            );
+            // Keep loadedUntil at the last confirmed window while the new
+            // request is in flight. A seek during a slow append must not be
+            // mistaken for an already-loaded range.
+            session.loadedUntil = session.startSeconds;
         }
         session.loading = true;
         var streamCompleted = false;
@@ -2157,44 +2123,39 @@
             track.mode = 'showing';
         }
 
-        var vttUrl = progressiveSubtitleUrlAt(session.baseVttUrl, session.startSeconds);
+        var jsonUrl = progressiveSubtitleUrlAt(session.baseJsonUrl, session.startSeconds);
         debug('progressive subtitle start reason=' + reason +
-            ' offset=' + session.startSeconds.toFixed(3) + 's ' + debugUrl(vttUrl));
-        var decoder = new TextDecoder('utf-8');
+            ' offset=' + session.startSeconds.toFixed(3) + 's ' + debugUrl(jsonUrl));
         var subtitleHeaders = new Headers(session.headers);
-        subtitleHeaders.set('Accept', 'text/vtt');
-        session.nativeFetch(vttUrl.toString(), {
+        subtitleHeaders.set('Accept', 'application/json');
+        session.nativeFetch(jsonUrl.toString(), {
             method: 'GET',
             headers: subtitleHeaders,
             credentials: session.credentials,
             cache: 'no-store',
             signal: controller.signal
         }).then(function (response) {
-            if (!response.ok || !response.body) {
+            if (!response.ok) {
                 throw new Error('subtitle stream status=' + response.status);
             }
-            var reader = response.body.getReader();
-            var pump = function () {
-                return reader.read().then(function (part) {
-                    if (progressiveSubtitleSession !== session || session.runId !== runId) {
-                        return reader.cancel();
-                    }
-                    if (part.done) {
-                        streamCompleted = true;
-                        feedProgressiveSubtitle(session, decoder.decode(), true);
-                        debug('progressive subtitle complete offset=' +
-                            session.startSeconds.toFixed(3) + 's cues=' + session.cueCount);
-                        return;
-                    }
-                    feedProgressiveSubtitle(
-                        session,
-                        decoder.decode(part.value, { stream: true }),
-                        false
-                    );
-                    return pump();
-                });
-            };
-            return pump();
+            return response.json();
+        }).then(function (data) {
+            if (progressiveSubtitleSession !== session || session.runId !== runId) {
+                return;
+            }
+            streamCompleted = true;
+            addProgressiveSubtitleEvents(session, data);
+            var previousFrom = Number(previousLoadedFrom);
+            var previousUntil = Number(previousLoadedUntil);
+            if (!append || !isFinite(previousFrom) || !isFinite(previousUntil)) {
+                session.loadedFrom = session.startSeconds;
+                session.loadedUntil = requestedUntil;
+            } else {
+                session.loadedFrom = Math.min(previousFrom, session.startSeconds);
+                session.loadedUntil = Math.max(previousUntil, requestedUntil);
+            }
+            debug('progressive subtitle complete offset=' +
+                session.startSeconds.toFixed(3) + 's cues=' + session.cueCount);
         }).catch(function (error) {
             if ((!error || error.name !== 'AbortError') &&
                     progressiveSubtitleSession === session && session.runId === runId) {
@@ -2299,21 +2260,21 @@
     function progressiveSubtitleJsonResponse(request, nativeFetch) {
         stopProgressiveSubtitle('switch');
 
-        var vttUrl = new URL(request.url);
-        vttUrl.pathname = vttUrl.pathname
-            .replace(/Stream\.js$/i, 'Stream.vtt')
-            .replace(/(\/Subtitles\/\d+)\/\d+\/Stream\.vtt$/i, '$1/Stream.vtt');
+        var jsonUrl = new URL(request.url);
+        jsonUrl.pathname = jsonUrl.pathname.replace(
+            /(\/Subtitles\/\d+)(?:\/\d+)?\/Stream\.js$/i,
+            '$1/Stream.js'
+        );
         var session = {
             id: ++progressiveSubtitleSequence,
             runId: 0,
             controller: null,
-            buffer: '',
             pending: [],
             cueCount: 0,
             firstCueLogged: false,
             startedAt: performance.now(),
             startSeconds: 0,
-            baseVttUrl: vttUrl.toString(),
+            baseJsonUrl: jsonUrl.toString(),
             nativeFetch: nativeFetch,
             headers: new Headers(request.headers),
             credentials: request.credentials,
