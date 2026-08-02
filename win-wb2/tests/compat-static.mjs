@@ -34,6 +34,8 @@ for (const marker of [
   'function progressiveSubtitleUrlAt',
   "subtitleHeaders.set('Accept', 'text/vtt')",
   'PROGRESSIVE_SUBTITLE_WINDOW_SECONDS',
+  "if (!append) {\n            clearProgressiveSubtitleCues(track);",
+  "video.addEventListener('seeking', session.seekedHandler)",
   "'advance'",
   'session.loading = false',
   'window.fetch = compatibleFetch',

@@ -2082,7 +2082,9 @@
         session.controller = new AbortController();
         var controller = session.controller;
         var track = currentManualSubtitleTrack();
-        clearProgressiveSubtitleCues(track);
+        if (!append) {
+            clearProgressiveSubtitleCues(track);
+        }
         if (track) {
             track.mode = 'showing';
         }
@@ -2142,6 +2144,7 @@
             return;
         }
         if (session.video && session.seekedHandler) {
+            session.video.removeEventListener('seeking', session.seekedHandler);
             session.video.removeEventListener('seeked', session.seekedHandler);
         }
         session.video = video;
@@ -2162,8 +2165,9 @@
                 if (!covered) {
                     startProgressiveSubtitleStream(session, Math.max(0, target - 15), 'seek');
                 }
-            }, 120);
+            }, 80);
         };
+        video.addEventListener('seeking', session.seekedHandler);
         video.addEventListener('seeked', session.seekedHandler);
     }
 
@@ -2178,6 +2182,7 @@
         }
         window.clearTimeout(session.seekTimer);
         if (session.video && session.seekedHandler) {
+            session.video.removeEventListener('seeking', session.seekedHandler);
             session.video.removeEventListener('seeked', session.seekedHandler);
         }
         abortProgressiveSubtitleStream(session);
