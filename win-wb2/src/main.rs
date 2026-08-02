@@ -786,7 +786,7 @@ mod tests {
         let patched = super::patch_index(br#"<html><head></head></html>"#.to_vec());
         let text = String::from_utf8(patched).unwrap();
         assert!(text.contains("jellium-series-compat.js"));
-        assert!(text.contains("series-compat-18"));
+        assert!(text.contains("series-compat-19"));
         assert!(text.contains("jellium-nord.css?v=series-compat-18"));
         assert!(!text.contains("theme-park.dev"));
         assert!(text.contains("rel=\"preload\" as=\"style\""));
