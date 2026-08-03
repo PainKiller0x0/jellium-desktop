@@ -14,6 +14,9 @@
     var STALE_WHILE_REVALIDATE_STABLE_GRACE_MS = 2 * 60 * 60 * 1000;
     var STALE_WHILE_REVALIDATE_VOLATILE_GRACE_MS = 30 * 60 * 1000;
     var MAX_MEMORY_METADATA_ENTRIES = 256;
+    var SUBTITLE_CACHE_VERSION = 'subtitle-v1';
+    var MAX_SUBTITLE_CACHE_RESPONSE_BYTES = 2 * 1024 * 1024;
+    var SUBTITLE_CACHE_BUCKET_SECONDS = 5;
     var PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3];
     var debugLines = [];
     var cacheStats = { hits: 0, misses: 0, writes: 0 };
@@ -24,10 +27,14 @@
     var apiEpisodeInFlight = new Map();
     var progressiveSubtitleSession = null;
     var progressiveSubtitleSequence = 0;
+    var overlaySubtitleSession = null;
+    var overlaySubtitleSequence = 0;
     // jellyfin-rs returns a bounded TrackEvents JSON window for Stream.js.
-    // Keep the client window aligned with the server's 30-second extraction
-    // window so the client does not repeatedly request the same boundary.
+    // Remote STRM subtitle seeks are inexpensive only for short FFmpeg output
+    // windows; keep this in lockstep with the server and start a few seconds
+    // before the seek target so the current cue is included immediately.
     var PROGRESSIVE_SUBTITLE_WINDOW_SECONDS = 30;
+    var PROGRESSIVE_SUBTITLE_LOOKBEHIND_SECONDS = 5;
     var PROGRESSIVE_SUBTITLE_MIN_LEAD_SECONDS = 8;
     // Jellyfin can request Stream.js before the HTML5 video element and its
     // TextTrack have been mounted. Do not tear down the session during that
@@ -1909,18 +1916,10 @@
         if (manualTrack) {
             return manualTrack;
         }
-        // The compatibility fetch intentionally returns an empty TrackEvents
-        // payload to the official renderer. Some Jellyfin versions therefore
-        // do not create a TextTrack at all. Create the same kind of manual
-        // track here so the bounded window cues still have a render target.
-        if (typeof video.addTextTrack === 'function') {
-            try {
-                return video.addTextTrack('subtitles', 'manualTrack', '');
-            } catch (_) {
-                // Fall through to an existing track if the browser disallows
-                // creating a track at this point in its lifecycle.
-            }
-        }
+        // The normal compatibility path returns real TrackEvents to the
+        // official Jellyfin renderer. Do not create another TextTrack here:
+        // WebView2 can then show both the official track and our progressive
+        // track at the same time, producing duplicate subtitles.
         return tracks[0] || null;
     }
 
@@ -2049,8 +2048,8 @@
     function progressiveSubtitlePrefetchLeadSeconds(video) {
         var playbackRate = Math.max(1, Number(video && video.playbackRate) || 1);
         return Math.max(
-            PROGRESSIVE_SUBTITLE_MIN_LEAD_SECONDS,
-            Math.min(18, playbackRate * 6)
+            Math.max(PROGRESSIVE_SUBTITLE_MIN_LEAD_SECONDS, 18),
+            Math.min(45, playbackRate * 15)
         );
     }
 
@@ -2060,7 +2059,11 @@
         url.pathname = url.pathname.replace(
             /(\/Videos\/[^/]+(?:\/[^/]+)?\/Subtitles\/\d+)(?:\/\d+)?\/Stream\.js$/i,
             function (_, prefix) {
-                return prefix + (ticks ? '/' + ticks : '') + '/Stream.js';
+                // An explicit zero window is important here. The unbounded
+                // Stream.js form can also be requested by WebView2's native
+                // media path; using /0/Stream.js lets the server coalesce
+                // both forms instead of starting two FFmpeg extractions.
+                return prefix + '/' + ticks + '/Stream.js';
             }
         );
         return url;
@@ -2293,20 +2296,480 @@
         }
     }
 
-    function progressiveSubtitleJsonResponse(request, nativeFetch) {
+    function startProgressiveSubtitleSession(request, nativeFetch) {
         stopProgressiveSubtitle('switch');
-        // Always preserve the real TrackEvents payload for Jellyfin Web.
-        // WebView2 identifies itself as Edge, so the official player may use
-        // its custom subtitle renderer instead of a native TextTrack. Returning
-        // an empty payload here makes that renderer conclude that the item has
-        // no subtitles at all. The server already returns the correct JSON;
-        // let the official renderer own cue creation, seeking, and playback
-        // rate handling.
-        debug('subtitle passthrough ' + debugUrl(request.url));
-        return Promise.resolve(nativeFetch(request)).then(function (response) {
-            debug('subtitle passthrough status=' + response.status);
-            return response;
+        var session = {
+            id: ++progressiveSubtitleSequence,
+            baseJsonUrl: request.url,
+            headers: request.headers,
+            credentials: request.credentials,
+            nativeFetch: nativeFetch,
+            video: null,
+            cues: [],
+            pending: [],
+            loadedFrom: 0,
+            loadedUntil: 0,
+            startSeconds: 0,
+            loading: true,
+            runId: 0,
+            controller: null,
+            monitor: null,
+            seekTimer: null,
+            attachedTrack: null,
+            attachedCueCount: 0,
+            cueCount: 0,
+            firstCueLogged: false,
+            startedAt: performance.now()
+        };
+        progressiveSubtitleSession = session;
+        session.monitor = window.setInterval(function () {
+            if (progressiveSubtitleSession !== session) {
+                return;
+            }
+            bindProgressiveSubtitleVideo(session, overlaySubtitleVideo());
+            attachProgressiveSubtitleTrack(session, currentManualSubtitleTrack());
+            maybeAdvanceProgressiveSubtitle(session, session.video);
+        }, 250);
+        bindProgressiveSubtitleVideo(session, overlaySubtitleVideo());
+        return session;
+    }
+
+    // Remote STRM media can expose embedded subtitles, but asking FFmpeg for
+    // the complete subtitle stream makes it scan the whole remote file. The
+    // Jellyfin Web renderer waits for that single response, so playback can
+    // appear to have no subtitles for tens of seconds. Use the server's
+    // bounded time-window endpoint and render the returned cues locally.
+    function overlaySubtitleVideo() {
+        return document.querySelector('video.htmlvideoplayer, video');
+    }
+
+    function removeOverlaySubtitleElement(session) {
+        if (session && session.overlay && session.overlay.parentNode) {
+            session.overlay.parentNode.removeChild(session.overlay);
+        }
+        if (session) {
+            session.overlay = null;
+        }
+    }
+
+    function ensureOverlaySubtitleElement(session) {
+        if (!session || !session.video || !document.body) {
+            return null;
+        }
+        if (session.overlay && session.overlay.isConnected) {
+            return session.overlay;
+        }
+        var overlay = document.createElement('div');
+        overlay.id = 'jellium-embedded-subtitle-overlay';
+        overlay.style.cssText = [
+            'position:fixed', 'left:7%', 'right:7%', 'bottom:10vh',
+            'z-index:2147483000', 'display:none', 'padding:4px 12px',
+            'color:#fff', 'font:22px/1.45 Arial,"Microsoft YaHei",sans-serif',
+            'font-weight:600', 'text-align:center', 'white-space:pre-line',
+            'text-shadow:0 2px 3px #000,2px 0 2px #000,-2px 0 2px #000',
+            'pointer-events:none', 'user-select:none', 'box-sizing:border-box'
+        ].join(';');
+        document.body.appendChild(overlay);
+        session.overlay = overlay;
+        return overlay;
+    }
+
+    function renderOverlaySubtitle(session) {
+        if (!session || overlaySubtitleSession !== session || !session.video) {
+            return;
+        }
+        var overlay = ensureOverlaySubtitleElement(session);
+        if (!overlay) {
+            return;
+        }
+        var currentTime = Number(session.video.currentTime) || 0;
+        var active = session.cues.filter(function (cue) {
+            return cue.start <= currentTime && currentTime < cue.end;
         });
+        var text = active.map(function (cue) { return cue.text; }).join('\n');
+        if (text === session.renderedText) {
+            return;
+        }
+        session.renderedText = text;
+        overlay.textContent = text;
+        overlay.style.display = text ? 'block' : 'none';
+    }
+
+    function addOverlaySubtitleEvents(session, data) {
+        if (!data || !Array.isArray(data.TrackEvents)) {
+            return 0;
+        }
+        var added = 0;
+        data.TrackEvents.forEach(function (event) {
+            var startTicks = Number(event && event.StartPositionTicks);
+            var endTicks = Number(event && event.EndPositionTicks);
+            var text = normalizeOverlaySubtitleText(event && event.Text);
+            if (!Number.isFinite(startTicks) || !Number.isFinite(endTicks) ||
+                    endTicks <= startTicks || !text) {
+                return;
+            }
+            var cue = {
+                start: startTicks / 10000000,
+                end: endTicks / 10000000,
+                text: text
+            };
+            var duplicate = session.cues.some(function (existing) {
+                return existing.start === cue.start &&
+                    existing.end === cue.end && existing.text === cue.text;
+            });
+            if (!duplicate) {
+                session.cues.push(cue);
+                added += 1;
+            }
+        });
+        session.cues.sort(function (left, right) {
+            return left.start - right.start || left.end - right.end;
+        });
+        return added;
+    }
+
+    function normalizeOverlaySubtitleText(value) {
+        return String(value || '')
+            .replace(/\\N/g, '\n')
+            .replace(/<br\s*\/?\s*>/gi, '\n')
+            .replace(/<[^>]*>/g, '')
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&amp;/gi, '&')
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .trim();
+    }
+
+    function abortOverlaySubtitleRequest(session) {
+        if (!session || !session.controller) {
+            return;
+        }
+        try {
+            session.controller.abort();
+        } catch (_) {
+            // The request may already have completed.
+        }
+        session.controller = null;
+    }
+
+    // Subtitle responses are immutable for a scanned STRM item. Reuse the
+    // existing on-disk Jellium cache, but deliberately leave authentication
+    // query parameters out of the key so a token refresh cannot throw away a
+    // perfectly valid local subtitle window.
+    function subtitleWindowCacheKey(session, startSeconds) {
+        var url = new URL(session.baseJsonUrl, window.location.href);
+        var bucket = Math.floor(Math.max(0, Number(startSeconds) || 0) /
+            SUBTITLE_CACHE_BUCKET_SECONDS) * SUBTITLE_CACHE_BUCKET_SECONDS;
+        return SUBTITLE_CACHE_VERSION + ':' + url.pathname + ':' + bucket.toFixed(0);
+    }
+
+    function subtitleWindowCacheGet(session, startSeconds) {
+        var key = subtitleWindowCacheKey(session, startSeconds);
+        if (session.subtitleWindows.has(key)) {
+            cacheStats.hits += 1;
+            return Promise.resolve(session.subtitleWindows.get(key));
+        }
+        return cacheGet(key).then(function (entry) {
+            if (!entry || typeof entry.body !== 'string') {
+                cacheStats.misses += 1;
+                return null;
+            }
+            var data = JSON.parse(entry.body);
+            if (!data || !Array.isArray(data.TrackEvents)) {
+                cacheStats.misses += 1;
+                return null;
+            }
+            session.subtitleWindows.set(key, data);
+            cacheStats.hits += 1;
+            debug('subtitle disk cache hit offset=' +
+                (Number(startSeconds) || 0).toFixed(3) + 's');
+            return data;
+        }).catch(function (error) {
+            cacheStats.misses += 1;
+            debug('subtitle disk cache read skipped=' +
+                (error && error.message || String(error)));
+            return null;
+        });
+    }
+
+    function subtitleWindowCachePut(session, startSeconds, data) {
+        if (!data || !Array.isArray(data.TrackEvents)) {
+            return;
+        }
+        var key = subtitleWindowCacheKey(session, startSeconds);
+        session.subtitleWindows.set(key, data);
+        var body;
+        try {
+            body = JSON.stringify(data);
+        } catch (_) {
+            return;
+        }
+        if (body.length > MAX_SUBTITLE_CACHE_RESPONSE_BYTES) {
+            debug('subtitle disk cache skipped bytes=' + body.length);
+            return;
+        }
+        cachePut({
+            key: key,
+            body: body,
+            status: 200,
+            headers: { 'content-type': 'application/json; charset=utf-8' },
+            updatedAt: Date.now()
+        }).catch(function (error) {
+            debug('subtitle disk cache write failed=' +
+                (error && error.message || String(error)));
+        });
+    }
+
+    function fetchOverlaySubtitleWindow(session, jsonUrl, subtitleHeaders, controller) {
+        var startSeconds = session.startSeconds;
+        return subtitleWindowCacheGet(session, startSeconds).then(function (cached) {
+            if (cached) {
+                return cached;
+            }
+            return session.nativeFetch(jsonUrl.toString(), {
+                method: 'GET',
+                headers: subtitleHeaders,
+                credentials: session.credentials,
+                cache: 'no-store',
+                signal: controller.signal
+            }).then(function (response) {
+                if (!response.ok) {
+                    throw new Error('subtitle window status=' + response.status);
+                }
+                return response.text().then(function (body) {
+                    if (!body || !body.trim()) {
+                        return { TrackEvents: [] };
+                    }
+                    return JSON.parse(body);
+                });
+            }).then(function (data) {
+                subtitleWindowCachePut(session, startSeconds, data);
+                return data;
+            });
+        });
+    }
+
+    function loadOverlaySubtitleWindow(session, startSeconds, append, reason) {
+        if (overlaySubtitleSession !== session) {
+            return;
+        }
+        var requestedStart = Math.max(0, Number(startSeconds) || 0);
+        // A single drag fires both `seeking` and `seeked` in Edge.  The values
+        // differ by milliseconds, but before normalisation they became two
+        // independent remote FFmpeg requests.  Keep the first one alive.
+        if (session.loading && Math.abs(requestedStart - session.startSeconds) < 2) {
+            debug('overlay subtitle dedupe reason=' + reason +
+                ' offset=' + requestedStart.toFixed(3) + 's');
+            return;
+        }
+        abortOverlaySubtitleRequest(session);
+        session.runId += 1;
+        var runId = session.runId;
+        if (!append) {
+            session.cues = [];
+            session.loadedFrom = requestedStart;
+            session.loadedUntil = session.loadedFrom;
+            session.renderedText = '';
+        }
+        session.loading = true;
+        session.startSeconds = requestedStart;
+        var requestedUntil = session.startSeconds + PROGRESSIVE_SUBTITLE_WINDOW_SECONDS;
+        var controller = new AbortController();
+        session.controller = controller;
+        var jsonUrl = progressiveSubtitleUrlAt(session.baseJsonUrl, session.startSeconds);
+        debug('overlay subtitle start reason=' + reason +
+            ' offset=' + session.startSeconds.toFixed(3) + 's ' + debugUrl(jsonUrl));
+        var subtitleHeaders = new Headers(session.headers);
+        subtitleHeaders.set('Accept', 'application/json');
+        fetchOverlaySubtitleWindow(session, jsonUrl, subtitleHeaders, controller).then(function (data) {
+            if (overlaySubtitleSession !== session || session.runId !== runId) {
+                return;
+            }
+            var added = addOverlaySubtitleEvents(session, data);
+            session.loadedUntil = Math.max(session.loadedUntil, requestedUntil);
+            session.loadedFrom = Math.min(session.loadedFrom, session.startSeconds);
+            debug('overlay subtitle complete offset=' +
+                session.startSeconds.toFixed(3) + 's cues+' + added +
+                ' total=' + session.cues.length);
+            renderOverlaySubtitle(session);
+        }).catch(function (error) {
+            if ((!error || error.name !== 'AbortError') &&
+                    overlaySubtitleSession === session && session.runId === runId) {
+                debug('overlay subtitle failed=' +
+                    (error && error.message || String(error)));
+            }
+        }).finally(function () {
+            if (overlaySubtitleSession === session && session.runId === runId) {
+                session.loading = false;
+                session.controller = null;
+            }
+        });
+    }
+
+    function overlaySubtitleLeadSeconds(video) {
+        var rate = Math.max(1, Number(video && video.playbackRate) || 1);
+        return Math.max(6, Math.min(12, rate * 4));
+    }
+
+    function maybeAdvanceOverlaySubtitle(session) {
+        if (overlaySubtitleSession !== session || !session.video || session.loading ||
+                session.video.seeking) {
+            return;
+        }
+        var currentTime = Number(session.video.currentTime) || 0;
+        var lead = overlaySubtitleLeadSeconds(session.video);
+        var outside = currentTime < session.loadedFrom - 2 ||
+            currentTime > session.loadedUntil + 2;
+        if (outside) {
+            loadOverlaySubtitleWindow(
+                session,
+                Math.max(0, currentTime - PROGRESSIVE_SUBTITLE_LOOKBEHIND_SECONDS),
+                false,
+                'resume'
+            );
+            return;
+        }
+        if (currentTime < session.loadedUntil - lead) {
+            renderOverlaySubtitle(session);
+            return;
+        }
+        loadOverlaySubtitleWindow(
+            session,
+            Math.max(0, session.loadedUntil - 5),
+            true,
+            'advance'
+        );
+    }
+
+    function bindOverlaySubtitleVideo(session, video) {
+        if (!video || session.video === video) {
+            return;
+        }
+        if (session.video && session.timeHandler) {
+            session.video.removeEventListener('timeupdate', session.timeHandler);
+            session.video.removeEventListener('seeking', session.seekHandler);
+            session.video.removeEventListener('seeked', session.seekHandler);
+            session.video.removeEventListener('ratechange', session.timeHandler);
+        }
+        session.video = video;
+        session.timeHandler = function () {
+            renderOverlaySubtitle(session);
+            maybeAdvanceOverlaySubtitle(session);
+        };
+        session.seekHandler = function () {
+            window.clearTimeout(session.seekTimer);
+            session.seekTimer = window.setTimeout(function () {
+                if (overlaySubtitleSession !== session || !session.video ||
+                        session.video.seeking) {
+                    return;
+                }
+                var target = Number(session.video.currentTime) || 0;
+                var outside = target < session.loadedFrom - 2 ||
+                    target > session.loadedUntil + 2;
+                debug('overlay subtitle seek target=' + target.toFixed(3) +
+                    's loaded=' + session.loadedFrom.toFixed(3) + '-' +
+                    session.loadedUntil.toFixed(3) + 's outside=' + outside);
+                if (outside) {
+                    loadOverlaySubtitleWindow(
+                        session,
+                        Math.max(0, target - PROGRESSIVE_SUBTITLE_LOOKBEHIND_SECONDS),
+                        false,
+                        'seek'
+                    );
+                } else {
+                    renderOverlaySubtitle(session);
+                    maybeAdvanceOverlaySubtitle(session);
+                }
+            }, 80);
+        };
+        video.addEventListener('timeupdate', session.timeHandler);
+        video.addEventListener('seeking', session.seekHandler);
+        video.addEventListener('seeked', session.seekHandler);
+        video.addEventListener('ratechange', session.timeHandler);
+        ensureOverlaySubtitleElement(session);
+        renderOverlaySubtitle(session);
+        debug('overlay subtitle video bound');
+    }
+
+    function stopOverlaySubtitle(reason) {
+        var session = overlaySubtitleSession;
+        if (!session) {
+            return;
+        }
+        overlaySubtitleSession = null;
+        window.clearInterval(session.monitor);
+        window.clearTimeout(session.seekTimer);
+        if (session.video && session.timeHandler) {
+            session.video.removeEventListener('timeupdate', session.timeHandler);
+            session.video.removeEventListener('seeking', session.seekHandler);
+            session.video.removeEventListener('seeked', session.seekHandler);
+            session.video.removeEventListener('ratechange', session.timeHandler);
+        }
+        abortOverlaySubtitleRequest(session);
+        removeOverlaySubtitleElement(session);
+        if (reason) {
+            debug('overlay subtitle stopped=' + reason +
+                ' cues=' + session.cues.length);
+        }
+    }
+
+    function startOverlaySubtitleSession(request, nativeFetch) {
+        stopOverlaySubtitle('switch');
+        var session = {
+            id: ++overlaySubtitleSequence,
+            baseJsonUrl: request.url,
+            headers: request.headers,
+            credentials: request.credentials,
+            nativeFetch: nativeFetch,
+            video: null,
+            overlay: null,
+            cues: [],
+            loadedFrom: 0,
+            loadedUntil: 0,
+            officialWindowUntil: 0,
+            renderedText: '',
+            loading: false,
+            runId: 0,
+            controller: null,
+            monitor: null,
+            seekTimer: null,
+            subtitleWindows: new Map()
+        };
+        overlaySubtitleSession = session;
+        session.monitor = window.setInterval(function () {
+            if (overlaySubtitleSession !== session) {
+                return;
+            }
+            bindOverlaySubtitleVideo(session, overlaySubtitleVideo());
+            renderOverlaySubtitle(session);
+            maybeAdvanceOverlaySubtitle(session);
+        }, 500);
+        bindOverlaySubtitleVideo(session, overlaySubtitleVideo());
+        return session;
+    }
+
+    function progressiveSubtitleJsonResponse(request, nativeFetch) {
+        // Keep the exact request/response pair for Jellyfin Web. WebView2's
+        // media bootstrap is sensitive to replacing the initial Stream.js
+        // request with a timestamped window: it can report that the client
+        // does not support the media before the video element is mounted.
+        // Return an empty TrackEvents response to disable Jellyfin Web's own
+        // Edge custom subtitle renderer. It otherwise paints a second layer
+        // over WebView2 and is only aware of the first server-side window.
+        // The overlay below is the sole renderer for embedded text subtitles;
+        // it fetches a window at the actual playback/seek position.
+        stopProgressiveSubtitle('switch');
+        stopOverlaySubtitle('switch');
+        var session = startOverlaySubtitleSession(request, nativeFetch);
+        session.officialWindowUntil = 0;
+        debug('subtitle single-overlay renderer installed ' + debugUrl(request.url));
+        return Promise.resolve(new Response(
+            JSON.stringify({ TrackEvents: [] }),
+            {
+                status: 200,
+                headers: { 'Content-Type': 'application/json; charset=utf-8' }
+            }
+        ));
     }
 
     function installFetchCompatibility() {

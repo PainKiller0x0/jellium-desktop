@@ -10,7 +10,9 @@ const instrumented = source.replace(
   `
     window.__jelliumSubtitleTest = {
         start: progressiveSubtitleJsonResponse,
-        session: function () { return progressiveSubtitleSession; }
+        progressiveSession: function () { return progressiveSubtitleSession; },
+        overlaySession: function () { return overlaySubtitleSession; },
+        advanceOverlay: maybeAdvanceOverlaySubtitle
     };
 })();
 `,
@@ -22,24 +24,47 @@ const payload = {
     {
       StartPositionTicks: 1_000_000,
       EndPositionTicks: 3_000_000,
-      Text: 'hello subtitle',
+      Text: '<b>hello subtitle</b>',
     },
   ],
 };
 let subtitleRequests = 0;
-const nativeFetch = async (input) => {
+const subtitleUrls = [];
+const diskCache = new Map();
+const nativeFetch = async (input, init = {}) => {
+  const url = input.url || String(input);
+  const parsed = new URL(url);
+  if (parsed.pathname === '/__jellium/metadata-cache') {
+    const action = parsed.searchParams.get('action');
+    const key = parsed.searchParams.get('key');
+    if (action === 'get') {
+      const entry = diskCache.get(key);
+      return entry
+        ? new Response(JSON.stringify(entry), { status: 200, headers: { 'Content-Type': 'application/json' } })
+        : new Response('{}', { status: 404, headers: { 'Content-Type': 'application/json' } });
+    }
+    if (action === 'put') {
+      const entry = JSON.parse(init.body);
+      diskCache.set(entry.key, entry);
+      return new Response('', { status: 204 });
+    }
+  }
   subtitleRequests += 1;
-  assert.match(input.url || String(input), /\/Subtitles\/2\/Stream\.js$/);
+  subtitleUrls.push(url);
+  assert.match(url, /\/Subtitles\/2\/(?:\d+\/)?Stream\.js$/);
   return new Response(JSON.stringify(payload), {
     status: 200,
     headers: { 'Content-Type': 'application/json' },
   });
 };
 
+let activeVideo = null;
 const document = {
   documentElement: { appendChild() {} },
-  body: null,
-  querySelector() { return null; },
+  body: {
+    appendChild(node) { node.isConnected = true; },
+  },
+  querySelector() { return activeVideo; },
   querySelectorAll() { return []; },
   getElementById(id) {
     if (id === 'jellium-settings-modal') return null;
@@ -57,6 +82,7 @@ const document = {
   createElement() {
     return {
       style: {},
+      isConnected: false,
       setAttribute() {},
       addEventListener() {},
       appendChild() {},
@@ -117,13 +143,49 @@ const request = new Request(
   'https://jellium.test/Videos/item/item/Subtitles/2/Stream.js',
 );
 const response = await context.window.fetch(request);
-assert.equal(subtitleRequests, 1, 'the real subtitle response should be fetched once');
-assert.equal(response.status, 200);
-assert.deepEqual(await response.json(), payload, 'TrackEvents must reach Jellyfin Web');
 assert.equal(
-  context.window.__jelliumSubtitleTest.session(),
-  null,
-  'passthrough mode must not leave a stale progressive session running',
+  subtitleRequests,
+  0,
+  'the official Edge renderer must receive an empty response without a competing request',
 );
-console.log('Jellium subtitle passthrough regression test passed');
+assert.equal(response.status, 200);
+assert.deepEqual(await response.json(), { TrackEvents: [] });
+const session = context.window.__jelliumSubtitleTest.overlaySession();
+assert.ok(session, 'a supplemental overlay session should follow the initial window');
+assert.equal(
+  context.window.__jelliumSubtitleTest.progressiveSession(),
+  null,
+  'the TextTrack renderer must stay disabled to prevent duplicate subtitles',
+);
+assert.equal(session.loadedFrom, 0);
+assert.equal(session.loadedUntil, 0);
+assert.equal(session.officialWindowUntil, 0);
+
+activeVideo = {
+  currentTime: 300,
+  playbackRate: 2,
+  seeking: false,
+  addEventListener() {},
+  removeEventListener() {},
+};
+session.video = activeVideo;
+context.window.__jelliumSubtitleTest.advanceOverlay(session);
+await new Promise(resolve => setTimeout(resolve, 0));
+assert.equal(subtitleRequests, 1, 'resume must request a supplemental subtitle window');
+assert.match(
+  subtitleUrls[0],
+  /\/Subtitles\/2\/2950000000\/Stream\.js$/,
+  'resume at 300 seconds must request the window beginning 5 seconds earlier',
+);
+assert.equal(session.cues[0]?.text, 'hello subtitle', 'overlay strips embedded HTML tags');
+
+const secondResponse = await context.window.fetch(request);
+assert.deepEqual(await secondResponse.json(), { TrackEvents: [] });
+const secondSession = context.window.__jelliumSubtitleTest.overlaySession();
+secondSession.video = activeVideo;
+context.window.__jelliumSubtitleTest.advanceOverlay(secondSession);
+await new Promise(resolve => setTimeout(resolve, 10));
+assert.equal(subtitleRequests, 1, 'a persisted subtitle window must bypass the media server');
+assert.equal(secondSession.cues[0]?.text, 'hello subtitle', 'the persisted window is rendered normally');
+console.log('Jellium supplemental subtitle runtime regression test passed');
 process.exit(0);

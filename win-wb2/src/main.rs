@@ -27,7 +27,7 @@ const LOCAL_PROXY_PORT: u16 = 39782;
 // Bump whenever the bundled compatibility layer changes. WebView2 keeps a
 // persistent HTTP cache between launches, so reusing this query value can
 // silently load an older script even when the executable contains new code.
-const FRONTEND_CACHE_BUSTER: &str = "series-compat-20";
+const FRONTEND_CACHE_BUSTER: &str = "series-compat-30";
 const PROXY_QUEUE_CAPACITY: usize = 64;
 
 struct ProxyState {
@@ -148,7 +148,13 @@ fn app_data_dir() -> PathBuf {
 }
 
 fn metadata_cache_dir() -> PathBuf {
-    let path = app_data_dir().join("jellium-cache");
+    // The durable cache is intentionally kept beside the portable executable.
+    // That makes it easy to inspect, back up, or remove with the Jellium
+    // folder, while WebView2's opaque browser profile remains in AppData.
+    let path = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join("jellium-cache")))
+        .unwrap_or_else(|| app_data_dir().join("jellium-cache"));
     let _ = fs::create_dir_all(&path);
     path
 }
@@ -786,8 +792,8 @@ mod tests {
         let patched = super::patch_index(br#"<html><head></head></html>"#.to_vec());
         let text = String::from_utf8(patched).unwrap();
         assert!(text.contains("jellium-series-compat.js"));
-        assert!(text.contains("series-compat-20"));
-        assert!(text.contains("jellium-nord.css?v=series-compat-20"));
+        assert!(text.contains("series-compat-30"));
+        assert!(text.contains("jellium-nord.css?v=series-compat-30"));
         assert!(!text.contains("theme-park.dev"));
         assert!(text.contains("rel=\"preload\" as=\"style\""));
     }
