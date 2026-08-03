@@ -1,0 +1,83 @@
+name: build-windows-wb2
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - win-wb2
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check Rust formatting
+        shell: pwsh
+        run: cargo fmt --manifest-path win-wb2/Cargo.toml -- --check
+
+      - name: Run Rust tests
+        shell: pwsh
+        run: cargo test --manifest-path win-wb2/Cargo.toml
+
+      - name: Run compatibility smoke test
+        shell: pwsh
+        run: node win-wb2/tests/compat-static.mjs
+
+      - name: Run subtitle runtime regression test
+        shell: pwsh
+        run: node win-wb2/tests/compat-progressive-subtitle-runtime.mjs
+
+      - name: Build WebView2 prototype
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --manifest-path win-wb2/Cargo.toml --release
+
+          $dist = Join-Path $PWD 'dist\jellium-win-wb2'
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item 'target\release\jellium-win-wb2.exe' $dist -Force
+          $loader = Get-ChildItem 'target\release\build\webview2-com-sys-*\out\x64\WebView2Loader.dll' | Select-Object -First 1
+          if (-not $loader) {
+            throw 'WebView2Loader.dll was not produced by the WebView2 build'
+          }
+          Copy-Item $loader.FullName $dist -Force
+          Copy-Item 'resources\jellyfin-web' (Join-Path $dist 'jellyfin-web') -Recurse -Force
+          Set-Content (Join-Path $dist 'README.txt') @(
+            'Jellium Desktop Windows WebView2 prototype'
+            'Requires the Microsoft Edge WebView2 Evergreen Runtime.'
+            'Set JELLIUM_SERVER_URL to override the saved Jellyfin server URL.'
+          )
+          Compress-Archive -Path (Join-Path $dist '*') -DestinationPath 'dist\jellium-win-wb2-windows-x64.zip' -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: jellium-win-wb2-windows-x64
+          path: dist/jellium-win-wb2-windows-x64.zip
+
+      - name: Publish GitHub Release asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = 'win-wb2-latest'
+          $asset = 'dist\jellium-win-wb2-windows-x64.zip'
+          gh release upload $tag $asset --clobber
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag $asset `
+              --target $env:GITHUB_SHA `
+              --title 'Jellium Desktop WebView2 Windows build' `
+              --notes 'Windows WebView2 build from the win-wb2 branch.'
+          }
