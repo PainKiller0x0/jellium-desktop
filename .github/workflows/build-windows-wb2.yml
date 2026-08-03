@@ -47,6 +47,11 @@ jobs:
           $dist = Join-Path $PWD 'dist\jellium-win-wb2'
           New-Item -ItemType Directory -Force $dist | Out-Null
           Copy-Item 'target\release\jellium-win-wb2.exe' $dist -Force
+          $loader = Get-ChildItem 'target\release\build\webview2-com-sys-*\out\x64\WebView2Loader.dll' | Select-Object -First 1
+          if (-not $loader) {
+            throw 'WebView2Loader.dll was not produced by the WebView2 build'
+          }
+          Copy-Item $loader.FullName $dist -Force
           Copy-Item 'resources\jellyfin-web' (Join-Path $dist 'jellyfin-web') -Recurse -Force
           Set-Content (Join-Path $dist 'README.txt') @(
             'Jellium Desktop Windows WebView2 prototype'
