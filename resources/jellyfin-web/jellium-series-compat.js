@@ -17,6 +17,8 @@
     var SUBTITLE_CACHE_VERSION = 'subtitle-v1';
     var MAX_SUBTITLE_CACHE_RESPONSE_BYTES = 2 * 1024 * 1024;
     var SUBTITLE_CACHE_BUCKET_SECONDS = 5;
+    var OVERLAY_SUBTITLE_DUPLICATE_TOLERANCE_SECONDS = 0.25;
+    var OVERLAY_SUBTITLE_FRAME_INTERVAL_MS = 33;
     var PLAYBACK_RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3];
     var debugLines = [];
     var cacheStats = { hits: 0, misses: 0, writes: 0 };
@@ -2383,8 +2385,17 @@
             return;
         }
         var currentTime = Number(session.video.currentTime) || 0;
+        var activeKeys = new Set();
         var active = session.cues.filter(function (cue) {
-            return cue.start <= currentTime && currentTime < cue.end;
+            if (!(cue.start <= currentTime && currentTime < cue.end)) {
+                return false;
+            }
+            var key = overlaySubtitleTextKey(cue.text);
+            if (activeKeys.has(key)) {
+                return false;
+            }
+            activeKeys.add(key);
+            return true;
         });
         var text = active.map(function (cue) { return cue.text; }).join('\n');
         if (text === session.renderedText) {
@@ -2413,11 +2424,16 @@
                 end: endTicks / 10000000,
                 text: text
             };
-            var duplicate = session.cues.some(function (existing) {
-                return existing.start === cue.start &&
-                    existing.end === cue.end && existing.text === cue.text;
+            var duplicate = session.cues.find(function (existing) {
+                return overlaySubtitleCuesNearDuplicate(existing, cue);
             });
-            if (!duplicate) {
+            if (duplicate) {
+                // Adjacent 30-second windows can contain the same event with
+                // tiny timestamp drift. Keep one cue and widen it only enough
+                // to cover both server responses.
+                duplicate.start = Math.min(duplicate.start, cue.start);
+                duplicate.end = Math.max(duplicate.end, cue.end);
+            } else {
                 session.cues.push(cue);
                 added += 1;
             }
@@ -2438,6 +2454,16 @@
             .replace(/&lt;/gi, '<')
             .replace(/&gt;/gi, '>')
             .trim();
+    }
+
+    function overlaySubtitleTextKey(value) {
+        return normalizeOverlaySubtitleText(value).replace(/\s+/g, ' ').trim();
+    }
+
+    function overlaySubtitleCuesNearDuplicate(left, right) {
+        return overlaySubtitleTextKey(left.text) === overlaySubtitleTextKey(right.text) &&
+            Math.abs(left.start - right.start) <= OVERLAY_SUBTITLE_DUPLICATE_TOLERANCE_SECONDS &&
+            Math.abs(left.end - right.end) <= OVERLAY_SUBTITLE_DUPLICATE_TOLERANCE_SECONDS;
     }
 
     function abortOverlaySubtitleRequest(session) {
@@ -2611,6 +2637,69 @@
         return Math.max(6, Math.min(12, rate * 4));
     }
 
+    function hideOverlaySubtitle(session) {
+        if (!session) {
+            return;
+        }
+        session.renderedText = '';
+        if (session.overlay) {
+            session.overlay.textContent = '';
+            session.overlay.style.display = 'none';
+        }
+    }
+
+    function disableCompetingSubtitleTracks(video) {
+        if (!video || !video.textTracks) {
+            return;
+        }
+        Array.prototype.forEach.call(video.textTracks, function (track) {
+            if (!track || (track.kind !== 'subtitles' && track.kind !== 'captions')) {
+                return;
+            }
+            try {
+                track.mode = 'disabled';
+            } catch (_) {
+                // A browser-created track may reject mode changes while seeking.
+            }
+        });
+    }
+
+    function cancelOverlaySubtitleRenderLoop(session) {
+        if (!session) {
+            return;
+        }
+        if (session.renderFrame != null && typeof window.cancelAnimationFrame === 'function') {
+            window.cancelAnimationFrame(session.renderFrame);
+        }
+        if (session.renderTimer != null) {
+            window.clearTimeout(session.renderTimer);
+        }
+        session.renderFrame = null;
+        session.renderTimer = null;
+    }
+
+    function scheduleOverlaySubtitleRender(session) {
+        if (!session || overlaySubtitleSession !== session || !session.video ||
+                session.video.paused || session.video.ended ||
+                session.renderFrame != null || session.renderTimer != null) {
+            return;
+        }
+        var tick = function () {
+            session.renderFrame = null;
+            session.renderTimer = null;
+            if (overlaySubtitleSession !== session || !session.video) {
+                return;
+            }
+            renderOverlaySubtitle(session);
+            scheduleOverlaySubtitleRender(session);
+        };
+        if (typeof window.requestAnimationFrame === 'function') {
+            session.renderFrame = window.requestAnimationFrame(tick);
+        } else {
+            session.renderTimer = window.setTimeout(tick, OVERLAY_SUBTITLE_FRAME_INTERVAL_MS);
+        }
+    }
+
     function maybeAdvanceOverlaySubtitle(session) {
         if (overlaySubtitleSession !== session || !session.video || session.loading ||
                 session.video.seeking) {
@@ -2649,15 +2738,41 @@
             session.video.removeEventListener('timeupdate', session.timeHandler);
             session.video.removeEventListener('seeking', session.seekHandler);
             session.video.removeEventListener('seeked', session.seekHandler);
-            session.video.removeEventListener('ratechange', session.timeHandler);
+            session.video.removeEventListener('ratechange', session.rateHandler);
+            session.video.removeEventListener('play', session.playHandler);
+            session.video.removeEventListener('pause', session.pauseHandler);
+            session.video.removeEventListener('ended', session.endedHandler);
+            cancelOverlaySubtitleRenderLoop(session);
         }
         session.video = video;
         session.timeHandler = function () {
             renderOverlaySubtitle(session);
             maybeAdvanceOverlaySubtitle(session);
+            scheduleOverlaySubtitleRender(session);
+        };
+        session.rateHandler = function () {
+            renderOverlaySubtitle(session);
+            maybeAdvanceOverlaySubtitle(session);
+            scheduleOverlaySubtitleRender(session);
+        };
+        session.playHandler = function () {
+            renderOverlaySubtitle(session);
+            scheduleOverlaySubtitleRender(session);
+        };
+        session.pauseHandler = function () {
+            renderOverlaySubtitle(session);
+            cancelOverlaySubtitleRenderLoop(session);
+        };
+        session.endedHandler = function () {
+            hideOverlaySubtitle(session);
+            cancelOverlaySubtitleRenderLoop(session);
         };
         session.seekHandler = function () {
             window.clearTimeout(session.seekTimer);
+            if (video.seeking) {
+                hideOverlaySubtitle(session);
+                cancelOverlaySubtitleRenderLoop(session);
+            }
             session.seekTimer = window.setTimeout(function () {
                 if (overlaySubtitleSession !== session || !session.video ||
                         session.video.seeking) {
@@ -2679,15 +2794,21 @@
                 } else {
                     renderOverlaySubtitle(session);
                     maybeAdvanceOverlaySubtitle(session);
+                    scheduleOverlaySubtitleRender(session);
                 }
             }, 80);
         };
         video.addEventListener('timeupdate', session.timeHandler);
         video.addEventListener('seeking', session.seekHandler);
         video.addEventListener('seeked', session.seekHandler);
-        video.addEventListener('ratechange', session.timeHandler);
+        video.addEventListener('ratechange', session.rateHandler);
+        video.addEventListener('play', session.playHandler);
+        video.addEventListener('pause', session.pauseHandler);
+        video.addEventListener('ended', session.endedHandler);
+        disableCompetingSubtitleTracks(video);
         ensureOverlaySubtitleElement(session);
         renderOverlaySubtitle(session);
+        scheduleOverlaySubtitleRender(session);
         debug('overlay subtitle video bound');
     }
 
@@ -2699,11 +2820,15 @@
         overlaySubtitleSession = null;
         window.clearInterval(session.monitor);
         window.clearTimeout(session.seekTimer);
+        cancelOverlaySubtitleRenderLoop(session);
         if (session.video && session.timeHandler) {
             session.video.removeEventListener('timeupdate', session.timeHandler);
             session.video.removeEventListener('seeking', session.seekHandler);
             session.video.removeEventListener('seeked', session.seekHandler);
-            session.video.removeEventListener('ratechange', session.timeHandler);
+            session.video.removeEventListener('ratechange', session.rateHandler);
+            session.video.removeEventListener('play', session.playHandler);
+            session.video.removeEventListener('pause', session.pauseHandler);
+            session.video.removeEventListener('ended', session.endedHandler);
         }
         abortOverlaySubtitleRequest(session);
         removeOverlaySubtitleElement(session);
@@ -2733,6 +2858,8 @@
             controller: null,
             monitor: null,
             seekTimer: null,
+            renderFrame: null,
+            renderTimer: null,
             subtitleWindows: new Map()
         };
         overlaySubtitleSession = session;
@@ -2741,8 +2868,10 @@
                 return;
             }
             bindOverlaySubtitleVideo(session, overlaySubtitleVideo());
+            disableCompetingSubtitleTracks(session.video);
             renderOverlaySubtitle(session);
             maybeAdvanceOverlaySubtitle(session);
+            scheduleOverlaySubtitleRender(session);
         }, 500);
         bindOverlaySubtitleVideo(session, overlaySubtitleVideo());
         return session;

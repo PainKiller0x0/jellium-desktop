@@ -12,7 +12,9 @@ const instrumented = source.replace(
         start: progressiveSubtitleJsonResponse,
         progressiveSession: function () { return progressiveSubtitleSession; },
         overlaySession: function () { return overlaySubtitleSession; },
-        advanceOverlay: maybeAdvanceOverlaySubtitle
+        advanceOverlay: maybeAdvanceOverlaySubtitle,
+        renderOverlay: renderOverlaySubtitle,
+        bindOverlay: bindOverlaySubtitleVideo
     };
 })();
 `,
@@ -25,6 +27,13 @@ const payload = {
       StartPositionTicks: 1_000_000,
       EndPositionTicks: 3_000_000,
       Text: '<b>hello subtitle</b>',
+    },
+    {
+      // Simulate the same cue returned by two overlapping subtitle windows
+      // with a small timestamp drift.
+      StartPositionTicks: 1_100_000,
+      EndPositionTicks: 3_100_000,
+      Text: 'hello subtitle',
     },
   ],
 };
@@ -139,6 +148,13 @@ const context = {
 };
 vm.runInNewContext(instrumented, context, { filename: scriptPath });
 
+const animationFrames = [];
+window.requestAnimationFrame = callback => {
+  animationFrames.push(callback);
+  return animationFrames.length;
+};
+window.cancelAnimationFrame = () => {};
+
 const request = new Request(
   'https://jellium.test/Videos/item/item/Subtitles/2/Stream.js',
 );
@@ -165,10 +181,14 @@ activeVideo = {
   currentTime: 300,
   playbackRate: 2,
   seeking: false,
+  paused: false,
+  ended: false,
+  textTracks: [{ kind: 'subtitles', mode: 'showing' }],
   addEventListener() {},
   removeEventListener() {},
 };
-session.video = activeVideo;
+context.window.__jelliumSubtitleTest.bindOverlay(session, activeVideo);
+assert.equal(activeVideo.textTracks[0].mode, 'disabled', 'the native subtitle layer must stay disabled');
 context.window.__jelliumSubtitleTest.advanceOverlay(session);
 await new Promise(resolve => setTimeout(resolve, 0));
 assert.equal(subtitleRequests, 1, 'resume must request a supplemental subtitle window');
@@ -178,10 +198,25 @@ assert.match(
   'resume at 300 seconds must request the window beginning 5 seconds earlier',
 );
 assert.equal(session.cues[0]?.text, 'hello subtitle', 'overlay strips embedded HTML tags');
+session.video.currentTime = 0.15;
+context.window.__jelliumSubtitleTest.renderOverlay(session);
+assert.equal(
+  session.overlay?.textContent,
+  'hello subtitle',
+  'overlapping duplicate cues must render only once',
+);
+activeVideo.currentTime = 0.35;
+animationFrames.shift()?.();
+assert.equal(
+  session.overlay?.textContent,
+  '',
+  'the render loop must follow the media clock between timeupdate events',
+);
 
 const secondResponse = await context.window.fetch(request);
 assert.deepEqual(await secondResponse.json(), { TrackEvents: [] });
 const secondSession = context.window.__jelliumSubtitleTest.overlaySession();
+activeVideo.currentTime = 300;
 secondSession.video = activeVideo;
 context.window.__jelliumSubtitleTest.advanceOverlay(secondSession);
 await new Promise(resolve => setTimeout(resolve, 10));
