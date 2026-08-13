@@ -1048,7 +1048,10 @@
         var media = document.querySelector('video');
         var existing = document.getElementById('jellium-external-player');
         var floating = document.getElementById('jellium-external-player-floating');
-        if (!media || !externalPlayback || !externalPlayback.url) {
+        var playbackPage = media ||
+            /(?:video\.html|playback)/i.test(window.location.href) ||
+            document.querySelector('.videoOsdBottom, .videoOsdPlayer, .videoPlayerContainer');
+        if (!playbackPage || !externalPlayback || !externalPlayback.url) {
             if (existing) existing.remove();
             if (floating) floating.remove();
             return;
