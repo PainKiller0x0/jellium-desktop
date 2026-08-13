@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Cursor;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,8 +28,9 @@ const LOCAL_PROXY_PORT: u16 = 39782;
 // Bump whenever the bundled compatibility layer changes. WebView2 keeps a
 // persistent HTTP cache between launches, so reusing this query value can
 // silently load an older script even when the executable contains new code.
-const FRONTEND_CACHE_BUSTER: &str = "series-compat-31";
+const FRONTEND_CACHE_BUSTER: &str = "series-compat-32";
 const PROXY_QUEUE_CAPACITY: usize = 64;
+const EXTERNAL_PLAYER_ROUTE: &str = "/__jellium/open-external";
 
 struct ProxyState {
     root: PathBuf,
@@ -232,6 +234,10 @@ fn serve_request(request: TinyRequest, state: &ProxyState) {
 
     let url = request.url().to_string();
     let path = url.split('?').next().unwrap_or("/");
+    if path == EXTERNAL_PLAYER_ROUTE {
+        serve_external_player(request, &url);
+        return;
+    }
     if let Some(route) = metadata_cache_route(request.method(), &url) {
         serve_metadata_cache(request, &state.metadata_cache_root, route);
         return;
@@ -254,6 +260,124 @@ fn serve_request(request: TinyRequest, state: &ProxyState) {
         return;
     }
     proxy_request(request, state, &url);
+}
+
+fn serve_external_player(request: TinyRequest, url: &str) {
+    if request.method() != &TinyMethod::Get {
+        respond_bytes(
+            request,
+            405,
+            "application/json; charset=utf-8",
+            br#"{"ok":false,"error":"method not allowed"}"#.to_vec(),
+        );
+        return;
+    }
+
+    let Some((_, query)) = url.split_once('?') else {
+        respond_bytes(
+            request,
+            400,
+            "application/json; charset=utf-8",
+            br#"{"ok":false,"error":"missing media url"}"#.to_vec(),
+        );
+        return;
+    };
+    let Some(media_url) = query_param(query, "url") else {
+        respond_bytes(
+            request,
+            400,
+            "application/json; charset=utf-8",
+            br#"{"ok":false,"error":"missing media url"}"#.to_vec(),
+        );
+        return;
+    };
+    if !is_allowed_external_media_url(&media_url) {
+        respond_bytes(
+            request,
+            400,
+            "application/json; charset=utf-8",
+            br#"{"ok":false,"error":"unsupported media url"}"#.to_vec(),
+        );
+        return;
+    }
+
+    match launch_potplayer(&media_url) {
+        Ok(player) => {
+            let body = serde_json::json!({ "ok": true, "player": player }).to_string();
+            respond_bytes(
+                request,
+                200,
+                "application/json; charset=utf-8",
+                body.into_bytes(),
+            );
+        }
+        Err(error) => {
+            let body = serde_json::json!({ "ok": false, "error": error }).to_string();
+            respond_bytes(
+                request,
+                404,
+                "application/json; charset=utf-8",
+                body.into_bytes(),
+            );
+        }
+    }
+}
+
+fn is_allowed_external_media_url(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    (lower.starts_with("http://") || lower.starts_with("https://"))
+        && value.len() <= 16 * 1024
+        && !value.chars().any(char::is_control)
+}
+
+#[cfg(windows)]
+fn launch_potplayer(media_url: &str) -> Result<String, String> {
+    let player = potplayer_path().ok_or_else(|| {
+        "未找到 PotPlayer，请设置 JELLIUM_POTPLAYER 为 PotPlayerMini64.exe 的完整路径".to_string()
+    })?;
+    Command::new(&player)
+        .arg(media_url)
+        .spawn()
+        .map_err(|error| format!("启动 PotPlayer 失败：{error}"))?;
+    Ok(player.display().to_string())
+}
+
+#[cfg(not(windows))]
+fn launch_potplayer(_media_url: &str) -> Result<String, String> {
+    Err("当前系统不是 Windows，无法启动 PotPlayer".to_string())
+}
+
+#[cfg(windows)]
+fn potplayer_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(path) = env::var_os("JELLIUM_POTPLAYER") {
+        candidates.push(PathBuf::from(path));
+    }
+    if let Ok(exe) = env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("PotPlayer").join("PotPlayerMini64.exe"));
+        candidates.push(parent.join("PotPlayerMini64.exe"));
+        if let Some(grandparent) = parent.parent() {
+            candidates.push(grandparent.join("PotPlayer").join("PotPlayerMini64.exe"));
+        }
+    }
+    for variable in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        if let Some(root) = env::var_os(variable) {
+            candidates.push(
+                PathBuf::from(root.clone())
+                    .join("DAUM")
+                    .join("PotPlayer")
+                    .join("PotPlayerMini64.exe"),
+            );
+            candidates.push(
+                PathBuf::from(root)
+                    .join("PotPlayer")
+                    .join("PotPlayerMini64.exe"),
+            );
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 fn metadata_cache_route(method: &TinyMethod, url: &str) -> Option<MetadataCacheRoute> {
@@ -771,8 +895,9 @@ fn respond_static(
 #[cfg(test)]
 mod tests {
     use super::{
-        PROXY_QUEUE_CAPACITY, has_request_header, metadata_cache_route, patch_config,
-        proxy_worker_count, rewrite_children_url, safe_relative_path,
+        EXTERNAL_PLAYER_ROUTE, PROXY_QUEUE_CAPACITY, has_request_header,
+        is_allowed_external_media_url, metadata_cache_route, patch_config, proxy_worker_count,
+        rewrite_children_url, safe_relative_path,
     };
     use tiny_http::Header;
 
@@ -792,8 +917,8 @@ mod tests {
         let patched = super::patch_index(br#"<html><head></head></html>"#.to_vec());
         let text = String::from_utf8(patched).unwrap();
         assert!(text.contains("jellium-series-compat.js"));
-        assert!(text.contains("series-compat-31"));
-        assert!(text.contains("jellium-nord.css?v=series-compat-31"));
+        assert!(text.contains("series-compat-32"));
+        assert!(text.contains("jellium-nord.css?v=series-compat-32"));
         assert!(!text.contains("theme-park.dev"));
         assert!(text.contains("rel=\"preload\" as=\"style\""));
     }
@@ -826,6 +951,20 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn external_player_route_accepts_only_http_media_urls() {
+        assert_eq!(EXTERNAL_PLAYER_ROUTE, "/__jellium/open-external");
+        assert!(is_allowed_external_media_url(
+            "https://media.example/video.mp4"
+        ));
+        assert!(is_allowed_external_media_url("http://127.0.0.1:8024/video"));
+        assert!(!is_allowed_external_media_url("file:///C:/video.mp4"));
+        assert!(!is_allowed_external_media_url("javascript:alert(1)"));
+        assert!(!is_allowed_external_media_url(
+            "https://media.example/\nvideo"
+        ));
     }
 
     #[test]

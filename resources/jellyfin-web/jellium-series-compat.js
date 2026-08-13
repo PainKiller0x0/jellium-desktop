@@ -31,6 +31,7 @@
     var progressiveSubtitleSequence = 0;
     var overlaySubtitleSession = null;
     var overlaySubtitleSequence = 0;
+    var externalPlayback = null;
     // jellyfin-rs returns a bounded TrackEvents JSON window for Stream.js.
     // Remote STRM subtitle seeks are inexpensive only for short FFmpeg output
     // windows; keep this in lockstep with the server and start a few seconds
@@ -954,6 +955,149 @@
         window.setInterval(ensurePlaybackRateButton, 700);
     }
 
+    function isPlaybackInfoRequest(url) {
+        try {
+            return /\/PlaybackInfo(?:$|\?)/i.test(new URL(url, window.location.href).pathname);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function rememberExternalPlayback(response) {
+        if (!response || !response.ok) {
+            return;
+        }
+        response.clone().json().then(function (payload) {
+            var sources = payload && Array.isArray(payload.MediaSources) ? payload.MediaSources : [];
+            var source = sources.find(function (candidate) {
+                return candidate && candidate.DirectStreamUrl && !candidate.TranscodingUrl &&
+                    (candidate.SupportsDirectPlay || candidate.SupportsDirectStream);
+            });
+            if (!source) {
+                externalPlayback = null;
+                window.__jelliumExternalPlayback = null;
+                return;
+            }
+            var video = Array.isArray(source.MediaStreams) && source.MediaStreams.find(function (stream) {
+                return stream && String(stream.Type || '').toLowerCase() === 'video';
+            });
+            externalPlayback = {
+                url: new URL(source.DirectStreamUrl, window.location.href).toString(),
+                codec: video && video.Codec || '',
+                container: source.Container || '',
+                updatedAt: Date.now()
+            };
+            window.__jelliumExternalPlayback = externalPlayback;
+            debug('直出源已捕获 codec=' + externalPlayback.codec +
+                ' container=' + externalPlayback.container);
+            ensureExternalPlayerButton();
+        }).catch(function (error) {
+            debug('读取直出源失败=' + (error && error.message || String(error)));
+        });
+    }
+
+    function externalPlayerUrl() {
+        if (!externalPlayback || !externalPlayback.url) {
+            return null;
+        }
+        return '/__jellium/open-external?url=' + encodeURIComponent(externalPlayback.url);
+    }
+
+    function openExternalPlayback() {
+        var endpoint = externalPlayerUrl();
+        if (!endpoint) {
+            return Promise.reject(new Error('当前没有可用的直出地址'));
+        }
+        return window.fetch(endpoint, { method: 'GET', cache: 'no-store' }).then(function (response) {
+            return response.json().catch(function () { return {}; }).then(function (payload) {
+                if (!response.ok || !payload.ok) {
+                    throw new Error(payload.error || ('启动外部播放器失败：' + response.status));
+                }
+                debug('已启动外部播放器');
+                return payload;
+            });
+        });
+    }
+
+    function createExternalPlayerButton(floating) {
+        var button = document.createElement('button');
+        button.id = floating ? 'jellium-external-player-floating' : 'jellium-external-player';
+        button.type = 'button';
+        button.className = floating ? 'jellium-external-player-fallback' : 'btnVideoOsdExternalPlayer autoSize';
+        button.textContent = 'PotPlayer';
+        button.title = '使用 PotPlayer 播放';
+        button.setAttribute('aria-label', '使用 PotPlayer 播放');
+        button.addEventListener('click', function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+            var oldText = button.textContent;
+            button.disabled = true;
+            button.textContent = '启动中…';
+            openExternalPlayback().catch(function (error) {
+                debug('外部播放器启动失败=' + (error && error.message || String(error)));
+                window.alert(error && error.message || '启动 PotPlayer 失败');
+            }).then(function () {
+                button.disabled = false;
+                button.textContent = oldText;
+            });
+        });
+        return button;
+    }
+
+    function ensureExternalPlayerButton() {
+        var media = document.querySelector('video');
+        var existing = document.getElementById('jellium-external-player');
+        var floating = document.getElementById('jellium-external-player-floating');
+        if (!media || !externalPlayback || !externalPlayback.url) {
+            if (existing) existing.remove();
+            if (floating) floating.remove();
+            return;
+        }
+
+        var controls = document.querySelector('.videoOsdBottom .buttons');
+        if (controls) {
+            if (floating) floating.remove();
+            if (!existing) {
+                existing = createExternalPlayerButton(false);
+                var settingsButton = controls.querySelector('.btnVideoOsdSettings');
+                if (settingsButton) controls.insertBefore(existing, settingsButton);
+                else controls.appendChild(existing);
+            }
+        } else if (!floating) {
+            floating = createExternalPlayerButton(true);
+            floating.style.cssText = [
+                'position:fixed', 'right:24px', 'bottom:112px', 'z-index:2147483644',
+                'border:1px solid rgba(255,255,255,.7)', 'border-radius:4px',
+                'background:rgba(18,28,43,.94)', 'color:#fff', 'padding:7px 10px',
+                'font:600 13px/1.2 Arial,sans-serif', 'cursor:pointer'
+            ].join(';');
+            document.documentElement.appendChild(floating);
+        }
+    }
+
+    function installExternalPlayerFallback() {
+        if (window.__jelliumExternalPlayerInstalled) {
+            ensureExternalPlayerButton();
+            return;
+        }
+        window.__jelliumExternalPlayerInstalled = true;
+        ensureExternalPlayerButton();
+        if (window.MutationObserver && document.documentElement) {
+            var scheduled = false;
+            var observer = new MutationObserver(function () {
+                if (scheduled) return;
+                scheduled = true;
+                window.setTimeout(function () {
+                    scheduled = false;
+                    ensureExternalPlayerButton();
+                }, 100);
+            });
+            observer.observe(document.documentElement, { childList: true, subtree: true });
+            window.__jelliumExternalPlayerObserver = observer;
+        }
+        window.setInterval(ensureExternalPlayerButton, 700);
+    }
+
     function installPlaybackDiagnostics() {
         if (window.__jelliumPlaybackDiagnosticsInstalled) {
             return;
@@ -999,6 +1143,7 @@
     installSettingsUi();
     installContinueSectionVisibility();
     installPlaybackRateUi();
+    installExternalPlayerFallback();
     installPlaybackDiagnostics();
 
     // Jellyfin Web generates collection-style /movies and /tv links for some
@@ -3015,6 +3160,9 @@
             // cache/network decision. Normalizing both inside and outside the
             // cache layer makes every detail/episode fallback request run twice.
             return fetchWithMetadataCache(request, networkFetch).then(function (response) {
+                if (isPlaybackInfoRequest(request.url)) {
+                    rememberExternalPlayback(response);
+                }
                 // Cached detail responses may predate this compatibility layer.
                 // Normalize those too, so an old zero-count entry cannot keep a
                 // series page empty forever.

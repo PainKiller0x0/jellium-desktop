@@ -18,6 +18,11 @@ The local proxy uses a stable loopback port and a persistent WebView2 data direc
 
 This client does not perform scraping itself. It reads the metadata returned by the configured Jellyfin server; library scanning and metadata refresh must still be completed on the server.
 
+When a direct-play source is returned but WebView2 cannot decode it (for example
+HEVC/MPEG-TS), the player page exposes a PotPlayer button. The Windows build
+looks for `PotPlayerMini64.exe` next to the Jellium folder's parent `PotPlayer`
+directory, in common installation directories, or at `JELLIUM_POTPLAYER`.
+
 Windows 10 and 11 normally have the WebView2 Evergreen Runtime. If it is missing, install it from:
 
 https://developer.microsoft.com/microsoft-edge/webview2/

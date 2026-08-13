@@ -43,6 +43,20 @@ const diskCache = new Map();
 const nativeFetch = async (input, init = {}) => {
   const url = input.url || String(input);
   const parsed = new URL(url);
+  if (parsed.pathname.endsWith('/PlaybackInfo')) {
+    return new Response(JSON.stringify({
+      MediaSources: [{
+        DirectStreamUrl: 'https://smartstrm.test/smartstrm_fid/demo/video.ts',
+        SupportsDirectPlay: true,
+        SupportsDirectStream: true,
+        Container: 'mp4',
+        MediaStreams: [{ Type: 'Video', Codec: 'hevc' }],
+      }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
   if (parsed.pathname === '/__jellium/metadata-cache') {
     const action = parsed.searchParams.get('action');
     const key = parsed.searchParams.get('key');
@@ -147,6 +161,17 @@ const context = {
   clearTimeout,
 };
 vm.runInNewContext(instrumented, context, { filename: scriptPath });
+
+const playbackResponse = await context.window.fetch(
+  new Request('https://jellium.test/Items/item/PlaybackInfo', { method: 'POST' }),
+);
+assert.equal(playbackResponse.status, 200);
+await new Promise(resolve => setTimeout(resolve, 0));
+assert.equal(
+  context.window.__jelliumExternalPlayback.url,
+  'https://smartstrm.test/smartstrm_fid/demo/video.ts',
+  'direct playback URL should be captured for the external-player fallback',
+);
 
 const animationFrames = [];
 window.requestAnimationFrame = callback => {
