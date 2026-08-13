@@ -32,6 +32,7 @@
     var overlaySubtitleSession = null;
     var overlaySubtitleSequence = 0;
     var externalPlayback = null;
+    var playbackInfoSeen = false;
     // jellyfin-rs returns a bounded TrackEvents JSON window for Stream.js.
     // Remote STRM subtitle seeks are inexpensive only for short FFmpeg output
     // windows; keep this in lockstep with the server and start a few seconds
@@ -963,37 +964,88 @@
         }
     }
 
+    function rememberExternalPlaybackPayload(payload) {
+        playbackInfoSeen = true;
+        var sources = payload && Array.isArray(payload.MediaSources) ? payload.MediaSources : [];
+        var source = sources.find(function (candidate) {
+            // DirectStreamUrl is already the server's authenticated direct
+            // source. Some Jellyfin-compatible servers omit the Supports*
+            // flags, so the URL itself is the reliable capability signal.
+            return candidate && candidate.DirectStreamUrl && !candidate.TranscodingUrl;
+        });
+        if (!source) {
+            externalPlayback = null;
+            window.__jelliumExternalPlayback = null;
+            debug('播放信息未找到直出源 MediaSources=' + sources.length);
+            ensureExternalPlayerButton();
+            return;
+        }
+        var video = Array.isArray(source.MediaStreams) && source.MediaStreams.find(function (stream) {
+            return stream && String(stream.Type || '').toLowerCase() === 'video';
+        });
+        externalPlayback = {
+            url: new URL(source.DirectStreamUrl, window.location.href).toString(),
+            codec: video && video.Codec || '',
+            container: source.Container || '',
+            updatedAt: Date.now()
+        };
+        window.__jelliumExternalPlayback = externalPlayback;
+        debug('直出源已捕获 codec=' + externalPlayback.codec +
+            ' container=' + externalPlayback.container);
+        ensureExternalPlayerButton();
+    }
+
     function rememberExternalPlayback(response) {
         if (!response || !response.ok) {
             return;
         }
         response.clone().json().then(function (payload) {
-            var sources = payload && Array.isArray(payload.MediaSources) ? payload.MediaSources : [];
-            var source = sources.find(function (candidate) {
-                return candidate && candidate.DirectStreamUrl && !candidate.TranscodingUrl &&
-                    (candidate.SupportsDirectPlay || candidate.SupportsDirectStream);
-            });
-            if (!source) {
-                externalPlayback = null;
-                window.__jelliumExternalPlayback = null;
-                return;
-            }
-            var video = Array.isArray(source.MediaStreams) && source.MediaStreams.find(function (stream) {
-                return stream && String(stream.Type || '').toLowerCase() === 'video';
-            });
-            externalPlayback = {
-                url: new URL(source.DirectStreamUrl, window.location.href).toString(),
-                codec: video && video.Codec || '',
-                container: source.Container || '',
-                updatedAt: Date.now()
-            };
-            window.__jelliumExternalPlayback = externalPlayback;
-            debug('直出源已捕获 codec=' + externalPlayback.codec +
-                ' container=' + externalPlayback.container);
-            ensureExternalPlayerButton();
+            rememberExternalPlaybackPayload(payload);
         }).catch(function (error) {
             debug('读取直出源失败=' + (error && error.message || String(error)));
         });
+    }
+
+    function installPlaybackInfoXhrCapture() {
+        var Xhr = window.XMLHttpRequest;
+        var prototype = Xhr && Xhr.prototype;
+        if (!prototype || prototype.__jelliumPlaybackInfoCaptureInstalled ||
+                typeof prototype.open !== 'function' || typeof prototype.send !== 'function') {
+            return false;
+        }
+        var nativeOpen = prototype.open;
+        var nativeSend = prototype.send;
+        prototype.open = function (method, url) {
+            this.__jelliumPlaybackInfoUrl = String(url || '');
+            return nativeOpen.apply(this, arguments);
+        };
+        prototype.send = function () {
+            var xhr = this;
+            if (isPlaybackInfoRequest(xhr.__jelliumPlaybackInfoUrl) &&
+                    typeof xhr.addEventListener === 'function') {
+                xhr.addEventListener('load', function () {
+                    if (xhr.status < 200 || xhr.status >= 300) {
+                        debug('XHR 播放信息状态=' + xhr.status);
+                        return;
+                    }
+                    var payload = xhr.response;
+                    if (!payload || typeof payload !== 'object') {
+                        try {
+                            payload = JSON.parse(xhr.responseText || '');
+                        } catch (_) {
+                            debug('XHR 播放信息不是 JSON');
+                            return;
+                        }
+                    }
+                    debug('XHR 播放信息已捕获');
+                    rememberExternalPlaybackPayload(payload);
+                });
+            }
+            return nativeSend.apply(this, arguments);
+        };
+        prototype.__jelliumPlaybackInfoCaptureInstalled = true;
+        debug('XHR 播放信息捕获已安装');
+        return true;
     }
 
     function externalPlayerUrl() {
@@ -1048,7 +1100,7 @@
         var media = document.querySelector('video');
         var existing = document.getElementById('jellium-external-player');
         var floating = document.getElementById('jellium-external-player-floating');
-        var playbackPage = media ||
+        var playbackPage = media || playbackInfoSeen ||
             /(?:video\.html|playback)/i.test(window.location.href) ||
             document.querySelector('.videoOsdBottom, .videoOsdPlayer, .videoPlayerContainer');
         if (!playbackPage || !externalPlayback || !externalPlayback.url) {
@@ -1146,6 +1198,7 @@
     installSettingsUi();
     installContinueSectionVisibility();
     installPlaybackRateUi();
+    installPlaybackInfoXhrCapture();
     installExternalPlayerFallback();
     installPlaybackDiagnostics();
 

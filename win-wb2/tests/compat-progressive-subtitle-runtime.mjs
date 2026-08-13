@@ -40,19 +40,20 @@ const payload = {
 let subtitleRequests = 0;
 const subtitleUrls = [];
 const diskCache = new Map();
+const playbackPayload = {
+  MediaSources: [{
+    DirectStreamUrl: 'https://smartstrm.test/smartstrm_fid/demo/video.ts',
+    SupportsDirectPlay: true,
+    SupportsDirectStream: true,
+    Container: 'mp4',
+    MediaStreams: [{ Type: 'Video', Codec: 'hevc' }],
+  }],
+};
 const nativeFetch = async (input, init = {}) => {
   const url = input.url || String(input);
   const parsed = new URL(url);
   if (parsed.pathname.endsWith('/PlaybackInfo')) {
-    return new Response(JSON.stringify({
-      MediaSources: [{
-        DirectStreamUrl: 'https://smartstrm.test/smartstrm_fid/demo/video.ts',
-        SupportsDirectPlay: true,
-        SupportsDirectStream: true,
-        Container: 'mp4',
-        MediaStreams: [{ Type: 'Video', Codec: 'hevc' }],
-      }],
-    }), {
+    return new Response(JSON.stringify(playbackPayload), {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     });
@@ -131,6 +132,35 @@ const window = {
   fetch: nativeFetch,
 };
 
+class FakePlaybackInfoXhr {
+  constructor() {
+    this.listeners = new Map();
+    this.responseType = 'json';
+    this.status = 0;
+    this.response = null;
+    this.responseText = '';
+  }
+
+  open(method, url) {
+    this.method = method;
+    this.url = url;
+  }
+
+  addEventListener(type, listener) {
+    this.listeners.set(type, listener);
+  }
+
+  send() {
+    this.status = 200;
+    this.response = playbackPayload;
+    this.responseText = JSON.stringify(playbackPayload);
+    const listener = this.listeners.get('load');
+    if (listener) listener.call(this);
+  }
+}
+
+window.XMLHttpRequest = FakePlaybackInfoXhr;
+
 const context = {
   window,
   document,
@@ -171,6 +201,17 @@ assert.equal(
   context.window.__jelliumExternalPlayback.url,
   'https://smartstrm.test/smartstrm_fid/demo/video.ts',
   'direct playback URL should be captured for the external-player fallback',
+);
+
+context.window.__jelliumExternalPlayback = null;
+const playbackXhr = new context.window.XMLHttpRequest();
+playbackXhr.open('POST', 'https://jellium.test/Items/item/PlaybackInfo');
+playbackXhr.send();
+await new Promise(resolve => setTimeout(resolve, 0));
+assert.equal(
+  context.window.__jelliumExternalPlayback.url,
+  'https://smartstrm.test/smartstrm_fid/demo/video.ts',
+  'XHR playback info should also be captured for the external-player fallback',
 );
 
 const animationFrames = [];
