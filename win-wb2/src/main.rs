@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Cursor;
@@ -20,7 +21,7 @@ use tiny_http::{
     Header, Method as TinyMethod, Request as TinyRequest, Response as TinyResponse, Server,
     StatusCode as TinyStatusCode,
 };
-use ureq::Agent;
+use ureq::{Agent, ResponseExt};
 use wry::{WebContext, WebViewBuilder};
 
 const NORD_CSS_PATH: &str = "jellium-nord.css";
@@ -28,9 +29,19 @@ const LOCAL_PROXY_PORT: u16 = 39782;
 // Bump whenever the bundled compatibility layer changes. WebView2 keeps a
 // persistent HTTP cache between launches, so reusing this query value can
 // silently load an older script even when the executable contains new code.
-const FRONTEND_CACHE_BUSTER: &str = "series-compat-34";
+const FRONTEND_CACHE_BUSTER: &str = "series-compat-46";
 const PROXY_QUEUE_CAPACITY: usize = 64;
 const EXTERNAL_PLAYER_ROUTE: &str = "/__jellium/open-external";
+const REDIRECT_STREAM_ROUTE: &str = "/__jellium/redirect-stream";
+const ACCELERATED_STREAM_ROUTE: &str = "/__jellium/accelerated-stream";
+const ACCELERATED_INITIAL_RANGE_BYTES: u64 = 4 * 1024 * 1024;
+const ACCELERATED_RANGE_BYTES: u64 = 16 * 1024 * 1024;
+const RESOLVED_STREAM_CACHE_SECONDS: u64 = 120;
+
+struct ResolvedStream {
+    url: String,
+    expires_at: u64,
+}
 
 struct ProxyState {
     root: PathBuf,
@@ -38,6 +49,7 @@ struct ProxyState {
     local_url: String,
     metadata_cache_root: PathBuf,
     agent: Agent,
+    resolved_streams: Mutex<HashMap<String, ResolvedStream>>,
 }
 
 enum MetadataCacheRoute {
@@ -67,6 +79,7 @@ fn main() -> wry::Result<()> {
         local_url: local_url.clone(),
         metadata_cache_root,
         agent: ureq::agent(),
+        resolved_streams: Mutex::new(HashMap::new()),
     });
     let server_state = state.clone();
     thread::Builder::new()
@@ -238,6 +251,14 @@ fn serve_request(request: TinyRequest, state: &ProxyState) {
         serve_external_player(request, &url);
         return;
     }
+    if path == REDIRECT_STREAM_ROUTE {
+        serve_redirect_stream(request, state, &url);
+        return;
+    }
+    if path == ACCELERATED_STREAM_ROUTE {
+        serve_accelerated_stream(request, state, &url);
+        return;
+    }
     if let Some(route) = metadata_cache_route(request.method(), &url) {
         serve_metadata_cache(request, &state.metadata_cache_root, route);
         return;
@@ -328,6 +349,288 @@ fn is_allowed_external_media_url(value: &str) -> bool {
     (lower.starts_with("http://") || lower.starts_with("https://"))
         && value.len() <= 16 * 1024
         && !value.chars().any(char::is_control)
+}
+
+fn serve_redirect_stream(request: TinyRequest, state: &ProxyState, url: &str) {
+    if request.method() != &TinyMethod::Get && request.method() != &TinyMethod::Head {
+        respond_bytes(
+            request,
+            405,
+            "text/plain; charset=utf-8",
+            b"method not allowed".to_vec(),
+        );
+        return;
+    }
+
+    let Some((_, query)) = url.split_once('?') else {
+        respond_bytes(
+            request,
+            400,
+            "text/plain; charset=utf-8",
+            b"missing media url".to_vec(),
+        );
+        return;
+    };
+    let Some(media_url) = query_param(query, "url") else {
+        respond_bytes(
+            request,
+            400,
+            "text/plain; charset=utf-8",
+            b"missing media url".to_vec(),
+        );
+        return;
+    };
+    if !is_allowed_external_media_url(&media_url) {
+        respond_bytes(
+            request,
+            400,
+            "text/plain; charset=utf-8",
+            b"unsupported media url".to_vec(),
+        );
+        return;
+    }
+
+    match resolve_stream_url(state, &media_url) {
+        Ok(final_url) => {
+            let response = TinyResponse::from_data(Vec::<u8>::new())
+                .with_status_code(TinyStatusCode(302))
+                .with_header(cors_header("Location", &final_url))
+                .with_header(cors_header("Cache-Control", "private, max-age=30"))
+                .with_header(cors_header("Access-Control-Allow-Origin", "*"));
+            let _ = request.respond(response);
+        }
+        Err(error) => {
+            respond_bytes(
+                request,
+                502,
+                "text/plain; charset=utf-8",
+                format!("stream resolution failed: {error}").into_bytes(),
+            );
+        }
+    }
+}
+
+fn resolve_stream_url(state: &ProxyState, media_url: &str) -> Result<String, String> {
+    let now = unix_seconds();
+    if let Ok(mut cache) = state.resolved_streams.lock() {
+        cache.retain(|_, entry| entry.expires_at > now);
+        if let Some(entry) = cache.get(media_url) {
+            return Ok(entry.url.clone());
+        }
+    }
+
+    let upstream_request = ureq::http::Request::builder()
+        .method("GET")
+        .uri(media_url)
+        .header("Range", "bytes=0-0")
+        .body(Vec::new())
+        .map_err(|error| format!("request build failed: {error}"))?;
+    let response = state
+        .agent
+        .run(upstream_request)
+        .map_err(|error| format!("upstream request failed: {error}"))?;
+    let status = response.status().as_u16();
+    let final_url = response.get_uri().to_string();
+    drop(response);
+
+    if !(200..300).contains(&status) || !is_allowed_external_media_url(&final_url) {
+        return Err(format!("unexpected upstream response {status}"));
+    }
+
+    if let Ok(mut cache) = state.resolved_streams.lock() {
+        cache.insert(
+            media_url.to_string(),
+            ResolvedStream {
+                url: final_url.clone(),
+                expires_at: now.saturating_add(RESOLVED_STREAM_CACHE_SECONDS),
+            },
+        );
+    }
+    Ok(final_url)
+}
+
+fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn serve_accelerated_stream(request: TinyRequest, state: &ProxyState, url: &str) {
+    if request.method() != &TinyMethod::Get && request.method() != &TinyMethod::Head {
+        respond_bytes(
+            request,
+            405,
+            "text/plain; charset=utf-8",
+            b"method not allowed".to_vec(),
+        );
+        return;
+    }
+
+    let Some((_, query)) = url.split_once('?') else {
+        respond_bytes(
+            request,
+            400,
+            "text/plain; charset=utf-8",
+            b"missing media url".to_vec(),
+        );
+        return;
+    };
+    let Some(media_url) = query_param(query, "url") else {
+        respond_bytes(
+            request,
+            400,
+            "text/plain; charset=utf-8",
+            b"missing media url".to_vec(),
+        );
+        return;
+    };
+    if !is_allowed_external_media_url(&media_url) {
+        respond_bytes(
+            request,
+            400,
+            "text/plain; charset=utf-8",
+            b"unsupported media url".to_vec(),
+        );
+        return;
+    }
+
+    let container = query_param(query, "container")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let requested_range = request.headers().iter().find_map(|header| {
+        let name: &str = header.field.as_str().into();
+        name.eq_ignore_ascii_case("range")
+            .then(|| parse_byte_range(header.value.as_str()))
+            .flatten()
+    });
+    let (start, requested_end) = requested_range.unwrap_or((0, None));
+    let prefetch_bytes = if start == 0
+        && requested_end
+            .map(|value| value <= ACCELERATED_INITIAL_RANGE_BYTES - 1)
+            .unwrap_or(true)
+    {
+        ACCELERATED_INITIAL_RANGE_BYTES
+    } else {
+        ACCELERATED_RANGE_BYTES
+    };
+    let end = requested_end
+        .map(|value| value.max(start.saturating_add(prefetch_bytes - 1)))
+        .unwrap_or_else(|| start.saturating_add(prefetch_bytes - 1));
+    let range_value = format!("bytes={start}-{end}");
+
+    let mut builder = ureq::http::Request::builder().method("GET").uri(media_url);
+    for header in request.headers() {
+        let name: &str = header.field.as_str().into();
+        if should_forward_request_header(name) && !name.eq_ignore_ascii_case("range") {
+            builder = builder.header(name, header.value.as_str());
+        }
+    }
+    builder = builder.header("Range", range_value);
+    let upstream_request = match builder.body(Vec::new()) {
+        Ok(request) => request,
+        Err(error) => {
+            respond_bytes(
+                request,
+                502,
+                "text/plain; charset=utf-8",
+                format!("accelerated request build failed: {error}").into_bytes(),
+            );
+            return;
+        }
+    };
+
+    match state.agent.run(upstream_request) {
+        Ok(upstream_response) => {
+            let status = upstream_response.status().as_u16();
+            let headers = upstream_response.headers().clone();
+            let content_length = headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok());
+            let content_range_total = headers
+                .get("content-range")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.rsplit_once('/'))
+                .and_then(|(_, total)| total.parse::<usize>().ok());
+            let head_probe = request.method() == &TinyMethod::Head;
+            let response_length = if head_probe {
+                content_range_total.or(content_length)
+            } else {
+                content_length
+            };
+            let response_status = if head_probe && (200..300).contains(&status) {
+                200
+            } else {
+                status
+            };
+            let reader: Box<dyn Read + Send> = if head_probe {
+                drop(upstream_response);
+                Box::new(std::io::empty())
+            } else {
+                Box::new(upstream_response.into_body().into_reader())
+            };
+            let mut response = TinyResponse::new(
+                TinyStatusCode(response_status),
+                Vec::new(),
+                reader,
+                response_length,
+                None,
+            );
+            for (name, value) in &headers {
+                let name_str = name.as_str();
+                let is_content_length = name_str.eq_ignore_ascii_case("content-length");
+                let is_content_range = name_str.eq_ignore_ascii_case("content-range");
+                let is_content_type = name_str.eq_ignore_ascii_case("content-type");
+                if should_forward_response_header(name_str)
+                    && !is_content_length
+                    && !(head_probe && is_content_range)
+                    && !(is_content_type && !container.is_empty())
+                    && let Ok(header) = Header::from_bytes(name_str.as_bytes(), value.as_bytes())
+                {
+                    response = response.with_header(header);
+                }
+            }
+            if !container.is_empty() {
+                let mime = match container.as_str() {
+                    "mp4" | "m4v" => "video/mp4",
+                    "webm" => "video/webm",
+                    "mkv" => "video/x-matroska",
+                    _ => "application/octet-stream",
+                };
+                response = response.with_header(cors_header("Content-Type", mime));
+            }
+            if response_length.is_some() {
+                response = response.with_chunked_threshold(usize::MAX);
+            }
+            response = response.with_header(cors_header("Access-Control-Allow-Origin", "*"));
+            let _ = request.respond(response);
+        }
+        Err(error) => {
+            respond_bytes(
+                request,
+                502,
+                "text/plain; charset=utf-8",
+                format!("accelerated upstream request failed: {error}").into_bytes(),
+            );
+        }
+    }
+}
+
+fn parse_byte_range(value: &str) -> Option<(u64, Option<u64>)> {
+    let value = value.trim();
+    let value = value.strip_prefix("bytes=")?;
+    if value.contains(',') {
+        return None;
+    }
+    let (start, end) = value.split_once('-')?;
+    let start = start.parse::<u64>().ok()?;
+    let end = if end.is_empty() {
+        None
+    } else {
+        Some(end.parse::<u64>().ok()?)
+    };
+    Some((start, end))
 }
 
 #[cfg(windows)]
@@ -568,8 +871,23 @@ fn serve_static(request: TinyRequest, state: &ProxyState, relative: &str, path: 
     }
 }
 
+fn is_video_stream_url(url: &str) -> bool {
+    let path = url.split('?').next().unwrap_or_default();
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("/videos/") && lower.contains("/stream")
+}
+
 fn proxy_request(mut request: TinyRequest, state: &ProxyState, url: &str) {
-    let method = request.method().to_string();
+    // PotPlayer probes HTTP media with HEAD first. jellyfin-rs may answer that
+    // probe without a Content-Length, while a one-byte ranged GET exposes the
+    // real size and Content-Range. Convert only media HEAD probes to that
+    // harmless ranged GET and suppress its body in the local response.
+    let head_media_probe = request.method() == &TinyMethod::Head && is_video_stream_url(url);
+    let method = if head_media_probe {
+        TinyMethod::Get.to_string()
+    } else {
+        request.method().to_string()
+    };
     let rewritten_url = if request.method() == &TinyMethod::Get
         && !has_request_header(request.headers(), "X-Jellium-Series-Compat")
     {
@@ -592,14 +910,21 @@ fn proxy_request(mut request: TinyRequest, state: &ProxyState, url: &str) {
         }
     }
 
+    let mut has_range = false;
     let mut builder = ureq::http::Request::builder()
         .method(method.as_str())
         .uri(upstream_url);
     for header in request.headers() {
         let name: &str = header.field.as_str().into();
         if should_forward_request_header(name) {
+            if name.eq_ignore_ascii_case("range") {
+                has_range = true;
+            }
             builder = builder.header(name, header.value.as_str());
         }
+    }
+    if head_media_probe && !has_range {
+        builder = builder.header("Range", "bytes=0-0");
     }
 
     let upstream_request = match builder.body(body) {
@@ -619,16 +944,56 @@ fn proxy_request(mut request: TinyRequest, state: &ProxyState, url: &str) {
         Ok(upstream_response) => {
             let status = upstream_response.status().as_u16();
             let headers = upstream_response.headers().clone();
-            let reader = upstream_response.into_body().into_reader();
-            let mut response =
-                TinyResponse::new(TinyStatusCode(status), Vec::new(), reader, None, None);
+            let content_length = headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<usize>().ok());
+            let content_range_total = headers
+                .get("content-range")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.rsplit_once('/'))
+                .and_then(|(_, total)| total.parse::<usize>().ok());
+            let response_length = if head_media_probe {
+                content_range_total.or(content_length)
+            } else {
+                content_length
+            };
+            let response_status = if head_media_probe && (200..300).contains(&status) {
+                200
+            } else {
+                status
+            };
+            let reader: Box<dyn Read + Send> = if head_media_probe {
+                drop(upstream_response);
+                Box::new(std::io::empty())
+            } else {
+                Box::new(upstream_response.into_body().into_reader())
+            };
+            let mut response = TinyResponse::new(
+                TinyStatusCode(response_status),
+                Vec::new(),
+                reader,
+                response_length,
+                None,
+            );
             for (name, value) in &headers {
+                let is_content_length = name.as_str().eq_ignore_ascii_case("content-length");
+                let is_content_range = name.as_str().eq_ignore_ascii_case("content-range");
                 if should_forward_response_header(name.as_str())
+                    && !is_content_length
+                    && !(head_media_probe && is_content_range)
                     && let Ok(header) =
                         Header::from_bytes(name.as_str().as_bytes(), value.as_bytes())
                 {
                     response = response.with_header(header);
                 }
+            }
+            if response_length.is_some() {
+                // PotPlayer and some WebView2 media paths do not handle a
+                // chunked response for a ranged MP4 stream. We already know
+                // the exact length from upstream, so keep the response on a
+                // normal Content-Length framed HTTP/1.1 body.
+                response = response.with_chunked_threshold(usize::MAX);
             }
             response = response.with_header(cors_header("Access-Control-Allow-Origin", "*"));
             let _ = request.respond(response);
@@ -852,6 +1217,7 @@ fn should_forward_response_header(name: &str) -> bool {
         "accept-ranges"
             | "cache-control"
             | "content-range"
+            | "content-length"
             | "content-type"
             | "etag"
             | "last-modified"
@@ -895,9 +1261,9 @@ fn respond_static(
 #[cfg(test)]
 mod tests {
     use super::{
-        EXTERNAL_PLAYER_ROUTE, PROXY_QUEUE_CAPACITY, has_request_header,
-        is_allowed_external_media_url, metadata_cache_route, patch_config, proxy_worker_count,
-        rewrite_children_url, safe_relative_path,
+        EXTERNAL_PLAYER_ROUTE, PROXY_QUEUE_CAPACITY, REDIRECT_STREAM_ROUTE, has_request_header,
+        is_allowed_external_media_url, is_video_stream_url, metadata_cache_route, parse_byte_range,
+        patch_config, proxy_worker_count, rewrite_children_url, safe_relative_path,
     };
     use tiny_http::Header;
 
@@ -917,8 +1283,8 @@ mod tests {
         let patched = super::patch_index(br#"<html><head></head></html>"#.to_vec());
         let text = String::from_utf8(patched).unwrap();
         assert!(text.contains("jellium-series-compat.js"));
-        assert!(text.contains("series-compat-34"));
-        assert!(text.contains("jellium-nord.css?v=series-compat-34"));
+        assert!(text.contains("series-compat-46"));
+        assert!(text.contains("jellium-nord.css?v=series-compat-46"));
         assert!(!text.contains("theme-park.dev"));
         assert!(text.contains("rel=\"preload\" as=\"style\""));
     }
@@ -956,6 +1322,7 @@ mod tests {
     #[test]
     fn external_player_route_accepts_only_http_media_urls() {
         assert_eq!(EXTERNAL_PLAYER_ROUTE, "/__jellium/open-external");
+        assert_eq!(REDIRECT_STREAM_ROUTE, "/__jellium/redirect-stream");
         assert!(is_allowed_external_media_url(
             "https://media.example/video.mp4"
         ));
@@ -965,6 +1332,25 @@ mod tests {
         assert!(!is_allowed_external_media_url(
             "https://media.example/\nvideo"
         ));
+    }
+
+    #[test]
+    fn media_head_probe_is_detected_for_local_stream_urls() {
+        assert!(is_video_stream_url(
+            "/Videos/item/stream.mp4?Static=true&JellyfinRsProxy=1"
+        ));
+        assert!(is_video_stream_url("/Videos/item/stream?Static=true"));
+        assert!(!is_video_stream_url("/Items/item/PlaybackInfo"));
+    }
+
+    #[test]
+    fn accelerated_range_parser_accepts_single_byte_ranges() {
+        assert_eq!(
+            parse_byte_range("bytes=0-1048575"),
+            Some((0, Some(1_048_575)))
+        );
+        assert_eq!(parse_byte_range("bytes=8388608-"), Some((8_388_608, None)));
+        assert_eq!(parse_byte_range("bytes=0-1,4-5"), None);
     }
 
     #[test]

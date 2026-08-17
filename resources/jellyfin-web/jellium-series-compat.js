@@ -33,6 +33,10 @@
     var overlaySubtitleSequence = 0;
     var externalPlayback = null;
     var playbackInfoSeen = false;
+    var localPlaybackUrlMap = new Map();
+    var directPlaybackUrlMap = new Map();
+    var redirectPlaybackUrlMap = new Map();
+    var directPlaybackFallbackMap = new Map();
     // jellyfin-rs returns a bounded TrackEvents JSON window for Stream.js.
     // Remote STRM subtitle seeks are inexpensive only for short FFmpeg output
     // windows; keep this in lockstep with the server and start a few seconds
@@ -964,6 +968,154 @@
         }
     }
 
+    function playbackInfoProxyUrl(url) {
+        try {
+            var parsed = new URL(url, window.location.href);
+            if (!isPlaybackInfoRequest(parsed.toString())) {
+                return url;
+            }
+            parsed.searchParams.set('JellyfinRsProxy', '1');
+            return parsed.toString();
+        } catch (_) {
+            return url;
+        }
+    }
+
+    function videoStreamProxyUrl(url) {
+        try {
+            var parsed = new URL(url, window.location.href);
+            if (
+                parsed.origin !== window.location.origin ||
+                !/\/Videos\/[^/]+(?:\/[^/]+)?\/stream(?:\.[a-z0-9]+)?$/i.test(parsed.pathname)
+            ) {
+                return url;
+            }
+            parsed.searchParams.set('JellyfinRsProxy', '1');
+            return parsed.toString();
+        } catch (_) {
+            return url;
+        }
+    }
+
+    function redirectPlaybackUrl(directUrl) {
+        try {
+            var url = new URL('/__jellium/redirect-stream', window.location.origin);
+            url.searchParams.set('url', directUrl);
+            return url.toString();
+        } catch (_) {
+            return directUrl;
+        }
+    }
+
+    function proxyPlaybackUrl(url) {
+        var mapped = mappedLocalPlaybackUrl(url);
+        if (!isPlaybackInfoRequest(mapped)) {
+            var direct = mappedDirectPlaybackUrl(mapped);
+            // Once PlaybackInfo has exposed SmartStrm's signed direct URL, do
+            // not send the media bytes back through jellyfin-rs. Vidhub
+            // follows this redirect on the client; keeping the same behavior
+            // here avoids turning the VPS into a video relay and preserves
+            // the source bandwidth. The same-origin proxy remains the
+            // fallback installed on the media element after a direct error.
+            if (direct !== mapped) {
+                return direct;
+            }
+            mapped = direct;
+        }
+        return videoStreamProxyUrl(playbackInfoProxyUrl(mapped));
+    }
+
+    function localPlaybackUrlKey(value) {
+        try {
+            var url = new URL(value, window.location.href);
+            return {
+                full: url.toString(),
+                path: url.origin + url.pathname
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function rememberLocalPlaybackUrl(remoteUrl, localUrl) {
+        var key = localPlaybackUrlKey(remoteUrl);
+        if (!key || !localUrl) {
+            return;
+        }
+        localPlaybackUrlMap.set(key.full, localUrl);
+        localPlaybackUrlMap.set(key.path, localUrl);
+    }
+
+    function rememberDirectPlaybackUrl(localUrl, directUrl, container) {
+        var localKey = localPlaybackUrlKey(localUrl);
+        var directKey = localPlaybackUrlKey(directUrl);
+        if (!localKey || !directKey || !directUrl) {
+            return;
+        }
+        // WebView2's native media element expects the requested Range to be
+        // returned exactly. The enlarged local Range response is intended
+        // for PotPlayer only; in-app playback stays on the proven direct URL.
+        directPlaybackUrlMap.set(localKey.full, directUrl);
+        directPlaybackUrlMap.set(localKey.path, directUrl);
+        var redirectUrl = redirectPlaybackUrl(directUrl);
+        var redirectKey = localPlaybackUrlKey(redirectUrl);
+        if (redirectKey) {
+            redirectPlaybackUrlMap.set(localKey.full, redirectUrl);
+            redirectPlaybackUrlMap.set(localKey.path, redirectUrl);
+            directPlaybackFallbackMap.set(redirectKey.full, localUrl);
+            directPlaybackFallbackMap.set(redirectKey.path, localUrl);
+        }
+        directPlaybackFallbackMap.set(directKey.full, localUrl);
+        directPlaybackFallbackMap.set(directKey.path, localUrl);
+    }
+
+    function mappedLocalPlaybackUrl(value) {
+        var key = localPlaybackUrlKey(value);
+        if (!key) {
+            return value;
+        }
+        return localPlaybackUrlMap.get(key.full) || localPlaybackUrlMap.get(key.path) || value;
+    }
+
+    function mappedDirectPlaybackUrl(value) {
+        var key = localPlaybackUrlKey(value);
+        if (!key) {
+            return value;
+        }
+        return directPlaybackUrlMap.get(key.full) || directPlaybackUrlMap.get(key.path) || value;
+    }
+
+    function mappedRedirectPlaybackUrl(value) {
+        var key = localPlaybackUrlKey(value);
+        if (!key) {
+            return value;
+        }
+        return redirectPlaybackUrlMap.get(key.full) || redirectPlaybackUrlMap.get(key.path) || value;
+    }
+
+    function acceleratedPlaybackUrl(directUrl, container) {
+        try {
+            var url = new URL('/__jellium/accelerated-stream', window.location.origin);
+            url.searchParams.set('url', directUrl);
+            var normalizedContainer = String(container || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+            if (normalizedContainer) {
+                url.searchParams.set('container', normalizedContainer);
+            }
+            return url.toString();
+        } catch (_) {
+            return directUrl;
+        }
+    }
+
+    function directPlaybackFallbackUrl(value) {
+        var key = localPlaybackUrlKey(value);
+        if (!key) {
+            return null;
+        }
+        return directPlaybackFallbackMap.get(key.full) ||
+            directPlaybackFallbackMap.get(key.path) || null;
+    }
+
     function rememberExternalPlaybackPayload(payload) {
         playbackInfoSeen = true;
         var sources = payload && Array.isArray(payload.MediaSources) ? payload.MediaSources : [];
@@ -983,8 +1135,11 @@
         var video = Array.isArray(source.MediaStreams) && source.MediaStreams.find(function (stream) {
             return stream && String(stream.Type || '').toLowerCase() === 'video';
         });
+        var directUrl = new URL(source.DirectStreamUrl, window.location.href).toString();
         externalPlayback = {
-            url: new URL(source.DirectStreamUrl, window.location.href).toString(),
+            url: isXunleiMediaSource(source)
+                ? redirectPlaybackUrl(directUrl)
+                : proxyPlaybackUrl(directUrl),
             codec: video && video.Codec || '',
             container: source.Container || '',
             updatedAt: Date.now()
@@ -1016,8 +1171,17 @@
         var nativeOpen = prototype.open;
         var nativeSend = prototype.send;
         prototype.open = function (method, url) {
-            this.__jelliumPlaybackInfoUrl = String(url || '');
-            return nativeOpen.apply(this, arguments);
+            var args = Array.prototype.slice.call(arguments);
+            var originalUrl = String(url || '');
+            var playbackUrl = proxyPlaybackUrl(originalUrl);
+            this.__jelliumPlaybackInfoUrl = playbackUrl;
+            if (playbackUrl !== originalUrl) {
+                args[1] = playbackUrl;
+                debug(isPlaybackInfoRequest(originalUrl)
+                    ? 'XHR 播放信息启用服务器代理'
+                    : 'XHR 视频流启用服务器代理');
+            }
+            return nativeOpen.apply(this, args);
         };
         prototype.send = function () {
             var xhr = this;
@@ -1037,7 +1201,20 @@
                             return;
                         }
                     }
-                    debug('XHR 播放信息已捕获');
+                    var rewritten = rewritePlaybackInfoPayload(payload, xhr.__jelliumPlaybackInfoUrl);
+                    if (rewritten.changed && xhr.response && typeof xhr.response === 'object') {
+                        try {
+                            Object.assign(xhr.response, rewritten.payload);
+                            payload = xhr.response;
+                            debug('XHR 播放信息已改为本地代理');
+                        } catch (_) {
+                            debug('XHR 播放信息已登记本地代理');
+                        }
+                    } else if (rewritten.changed) {
+                        debug('XHR 播放信息已登记本地代理');
+                    } else {
+                        debug('XHR 播放信息已捕获');
+                    }
                     rememberExternalPlaybackPayload(payload);
                 });
             }
@@ -1045,6 +1222,116 @@
         };
         prototype.__jelliumPlaybackInfoCaptureInstalled = true;
         debug('XHR 播放信息捕获已安装');
+        return true;
+    }
+
+    function installMediaSourceProxy() {
+        var Media = window.HTMLMediaElement;
+        var prototype = Media && Media.prototype;
+        if (!prototype || prototype.__jelliumMediaSourceProxyInstalled) {
+            return false;
+        }
+        function installMediaFallback(media) {
+            if (!media || media.__jelliumMediaFallbackInstalled ||
+                    typeof media.addEventListener !== 'function') {
+                return;
+            }
+            media.addEventListener('error', function () {
+                if ((media.__jelliumPlaybackFallbackCount || 0) >= 2) {
+                    return;
+                }
+                var current = media.currentSrc || media.src || '';
+                var fallback = directPlaybackFallbackUrl(current);
+                if (!fallback) {
+                    return;
+                }
+                media.__jelliumPlaybackFallbackCount =
+                    (media.__jelliumPlaybackFallbackCount || 0) + 1;
+                media.__jelliumForcedPlaybackUrl = fallback;
+                var resumeTime = Number(media.currentTime) || 0;
+                var shouldResume = !media.paused;
+                debug('加速取流失败，切换后备地址 #' + media.__jelliumPlaybackFallbackCount);
+                try {
+                    media.src = fallback;
+                    if (typeof media.load === 'function') {
+                        media.load();
+                    }
+                    if (resumeTime > 0 && typeof media.addEventListener === 'function') {
+                        var restorePosition = function () {
+                            media.removeEventListener('loadedmetadata', restorePosition);
+                            try {
+                                media.currentTime = resumeTime;
+                            } catch (_) {
+                                // The fallback stream may not be seekable yet.
+                            }
+                        };
+                        media.addEventListener('loadedmetadata', restorePosition);
+                    }
+                    if (shouldResume && typeof media.play === 'function') {
+                        var playResult = media.play();
+                        if (playResult && typeof playResult.catch === 'function') {
+                            playResult.catch(function () {});
+                        }
+                    }
+                } catch (_) {
+                    debug('本地代理回落失败');
+                }
+            });
+            media.__jelliumMediaFallbackInstalled = true;
+        }
+        function mediaPlaybackUrl(media, value) {
+            var local = mappedLocalPlaybackUrl(value);
+            if (media && media.__jelliumForcedPlaybackUrl) {
+                return media.__jelliumForcedPlaybackUrl;
+            }
+            var direct = mappedDirectPlaybackUrl(local);
+            var redirect = mappedRedirectPlaybackUrl(local);
+            if (redirect !== local) {
+                debug('媒体源通过本机 302 跳转直连迅雷，失败时回落本地代理');
+            }
+            return redirect !== local ? redirect : direct;
+        }
+        var descriptor = Object.getOwnPropertyDescriptor(prototype, 'src');
+        if (descriptor && descriptor.set && Object.defineProperty) {
+            try {
+                Object.defineProperty(prototype, 'src', {
+                    configurable: descriptor.configurable,
+                    enumerable: descriptor.enumerable,
+                    get: descriptor.get,
+                    set: function (value) {
+                        installMediaFallback(this);
+                        if (this.__jelliumForcedPlaybackUrl &&
+                                String(value) !== String(this.__jelliumForcedPlaybackUrl)) {
+                            this.__jelliumForcedPlaybackUrl = '';
+                            this.__jelliumPlaybackFallbackCount = 0;
+                        }
+                        var mapped = mediaPlaybackUrl(this, value);
+                        return descriptor.set.call(this, mapped);
+                    }
+                });
+            } catch (_) {
+                // Some WebView2 builds expose a non-configurable src property.
+            }
+        }
+        var nativeSetAttribute = prototype.setAttribute;
+        if (typeof nativeSetAttribute === 'function') {
+            prototype.setAttribute = function (name, value) {
+                if (String(name).toLowerCase() === 'src') {
+                    installMediaFallback(this);
+                    if (this.__jelliumForcedPlaybackUrl &&
+                            String(value) !== String(this.__jelliumForcedPlaybackUrl)) {
+                        this.__jelliumForcedPlaybackUrl = '';
+                        this.__jelliumPlaybackFallbackCount = 0;
+                    }
+                }
+                var mapped = String(name).toLowerCase() === 'src'
+                    ? mediaPlaybackUrl(this, value)
+                    : value;
+                return nativeSetAttribute.call(this, name, mapped);
+            };
+        }
+        prototype.__jelliumMediaSourceProxyInstalled = true;
+        debug('媒体源代理已安装');
         return true;
     }
 
@@ -1199,6 +1486,7 @@
     installContinueSectionVisibility();
     installPlaybackRateUi();
     installPlaybackInfoXhrCapture();
+    installMediaSourceProxy();
     installExternalPlayerFallback();
     installPlaybackDiagnostics();
 
@@ -1608,6 +1896,299 @@
         });
     }
 
+    function homeListRequestKind(value) {
+        try {
+            var pathname = new URL(value, window.location.href).pathname.replace(/\/+$/, '');
+            if (/\/Shows\/NextUp$/i.test(pathname)) {
+                return 'next-up';
+            }
+            if (/\/Items\/Resume$/i.test(pathname)) {
+                return 'resume';
+            }
+        } catch (_) {
+            // Ignore malformed URLs; the original response must pass through.
+        }
+        return '';
+    }
+
+    function normalizeHomeKeyPart(value) {
+        var text = String(value == null ? '' : value);
+        try {
+            if (typeof text.normalize === 'function') {
+                text = text.normalize('NFKC');
+            }
+        } catch (_) {
+            // Older WebView2 runtimes may not expose Unicode normalization.
+        }
+        return text.toLowerCase()
+            .replace(/[\s\-_—:：·"“”‘’（）()[\]{}.,!?！？/\\]+/g, '')
+            .trim();
+    }
+
+    function homeEpisodeKey(item) {
+        if (!item || (item.Type !== 'Episode' && item.ParentIndexNumber == null && item.IndexNumber == null)) {
+            return '';
+        }
+        var seriesName = item.SeriesName || item.SeriesSortName || item.ParentName || '';
+        var season = Number(item.ParentIndexNumber);
+        var episode = Number(item.IndexNumber);
+        if (!seriesName || !isFinite(season) || !isFinite(episode)) {
+            return '';
+        }
+        var normalizedName = normalizeHomeKeyPart(seriesName);
+        if (!normalizedName) {
+            return '';
+        }
+        // Include the year only when both records actually provide one. The
+        // season/episode pair remains the primary identity, while the year
+        // prevents similarly named reboots from being merged accidentally.
+        var year = Number(item.ProductionYear);
+        var yearPart = isFinite(year) && year > 0 ? String(year) : '';
+        return normalizedName + '|' + yearPart + '|' + season + '|' + episode;
+    }
+
+    function sourcePriorityText(value) {
+        return String(value == null ? '' : value).toLowerCase();
+    }
+
+    function mediaSourcePriority(source) {
+        if (!source) {
+            return 0;
+        }
+        var text = [source.Id, source.Name, source.Path, source.DirectStreamUrl]
+            .map(sourcePriorityText)
+            .join(' ');
+        if (text.indexOf('xunlei') >= 0 || text.indexOf('thunder') >= 0 || text.indexOf('迅雷') >= 0) {
+            return 30;
+        }
+        if (text.indexOf('quark') >= 0 || text.indexOf('myquark') >= 0 || text.indexOf('夸克') >= 0) {
+            return 20;
+        }
+        return 10;
+    }
+
+    function homeItemPriority(item) {
+        var sources = item && Array.isArray(item.MediaSources) ? item.MediaSources : [];
+        var priority = sources.reduce(function (current, source) {
+            return Math.max(current, mediaSourcePriority(source));
+        }, mediaSourcePriority(item));
+        var ticks = Number(item && item.UserData && item.UserData.PlaybackPositionTicks);
+        return priority * 1000000000000 + (isFinite(ticks) && ticks > 0 ? ticks : 0);
+    }
+
+    function mediaSourceKey(source) {
+        if (!source) {
+            return '';
+        }
+        return String(source.Id || source.DirectStreamUrl || source.Path || source.Name || '');
+    }
+
+    function mergeHomeItemSources(items, winner) {
+        var sources = [];
+        var seen = {};
+        items.forEach(function (item) {
+            var itemSources = item && Array.isArray(item.MediaSources) ? item.MediaSources : [];
+            itemSources.forEach(function (source) {
+                var key = mediaSourceKey(source);
+                if (!key || seen[key]) {
+                    return;
+                }
+                seen[key] = true;
+                sources.push(source);
+            });
+        });
+        sources.sort(function (left, right) {
+            return mediaSourcePriority(right) - mediaSourcePriority(left);
+        });
+        if (!sources.length && !(winner && Array.isArray(winner.MediaSources))) {
+            return winner;
+        }
+        var merged = Object.assign({}, winner);
+        merged.MediaSources = sources;
+        var declaredCount = Number(winner && winner.MediaSourceCount);
+        merged.MediaSourceCount = Math.max(
+            sources.length,
+            isFinite(declaredCount) && declaredCount > 0 ? declaredCount : 0
+        );
+        return merged;
+    }
+
+    function dedupeHomeItemsPayload(payload, kind) {
+        if (!payload || !Array.isArray(payload.Items) || payload.Items.length < 2 || !kind) {
+            return { payload: payload, removed: 0 };
+        }
+        var groups = new Map();
+        var ordered = [];
+        payload.Items.forEach(function (item) {
+            var key = homeEpisodeKey(item);
+            if (!key) {
+                ordered.push({ key: '', items: [item], winner: item });
+                return;
+            }
+            var group = groups.get(key);
+            if (!group) {
+                group = { key: key, items: [], winner: item, order: ordered.length };
+                groups.set(key, group);
+                ordered.push(group);
+            }
+            group.items.push(item);
+            if (homeItemPriority(item) > homeItemPriority(group.winner)) {
+                group.winner = item;
+            }
+        });
+
+        var removed = 0;
+        var items = ordered.map(function (group) {
+            if (!group.key || group.items.length < 2) {
+                return group.winner;
+            }
+            removed += group.items.length - 1;
+            return mergeHomeItemSources(group.items, group.winner);
+        });
+        if (!removed) {
+            return { payload: payload, removed: 0 };
+        }
+        var normalized = Object.assign({}, payload, { Items: items });
+        var total = Number(payload.TotalRecordCount);
+        if (isFinite(total)) {
+            normalized.TotalRecordCount = Math.max(0, total - removed);
+        }
+        debug(kind + ' deduped home items removed=' + removed + ' remaining=' + items.length);
+        return { payload: normalized, removed: removed };
+    }
+
+    function dedupeHomeItemsResponse(request, response) {
+        var kind = homeListRequestKind(request.url);
+        if (!kind || !response || !response.ok) {
+            return Promise.resolve(response);
+        }
+        return response.clone().json().then(function (payload) {
+            var result = dedupeHomeItemsPayload(payload, kind);
+            return result.removed ? jsonResponseLike(response, result.payload) : response;
+        }).catch(function () {
+            return response;
+        });
+    }
+
+    function isXunleiMediaSource(source) {
+        if (!source) {
+            return false;
+        }
+        return mediaSourcePriority(source) >= 30;
+    }
+
+    function playbackInfoItemId(value) {
+        try {
+            var pathname = new URL(value, window.location.href).pathname;
+            var match = /\/Items\/([^/]+)\/PlaybackInfo$/i.exec(pathname);
+            return match ? decodeURIComponent(match[1]) : '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function playbackApiValue(methodName, fallback, requestUrl) {
+        try {
+            var client = window.ApiClient;
+            if (client && typeof client[methodName] === 'function') {
+                var value = client[methodName]();
+                if (value) {
+                    return value;
+                }
+            }
+            var url = new URL(requestUrl, window.location.href);
+            return url.searchParams.get(methodName === 'accessToken' ? 'apiKey' : 'deviceId') || fallback;
+        } catch (_) {
+            return fallback;
+        }
+    }
+
+    function xunleiLocalPlaybackUrl(requestUrl, itemId, source) {
+        var container = String(source && source.Container || '').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'mp4';
+        var url = new URL(
+            '/Videos/' + encodeURIComponent(itemId) + '/stream.' + encodeURIComponent(container),
+            window.location.origin
+        );
+        url.searchParams.set('Static', 'true');
+        url.searchParams.set('mediaSourceId', source && source.Id || itemId);
+        var deviceId = playbackApiValue('deviceId', '', requestUrl);
+        var apiKey = playbackApiValue('accessToken', '', requestUrl);
+        if (deviceId) {
+            url.searchParams.set('deviceId', deviceId);
+        }
+        if (apiKey) {
+            url.searchParams.set('apiKey', apiKey);
+        }
+        if (source && source.ETag) {
+            url.searchParams.set('Tag', source.ETag);
+        }
+        url.searchParams.set('JellyfinRsProxy', '1');
+        return url.toString();
+    }
+
+    function rewritePlaybackInfoPayload(payload, requestUrl) {
+        if (!payload || !Array.isArray(payload.MediaSources)) {
+            return { payload: payload, changed: false };
+        }
+        var itemId = playbackInfoItemId(requestUrl);
+        if (!itemId) {
+            return { payload: payload, changed: false };
+        }
+        var changed = false;
+        var sources = payload.MediaSources.map(function (source) {
+            if (!isXunleiMediaSource(source)) {
+                return source;
+            }
+            var localUrl = xunleiLocalPlaybackUrl(requestUrl, itemId, source);
+            // Jellyfin's playback manager may use Path, DirectStreamUrl, or a
+            // URL assembled from the original source object depending on the
+            // selected client/player. Keep all known remote forms mapped to
+            // the same-origin proxy URL so the in-app player and the external
+            // player button cannot diverge.
+            rememberLocalPlaybackUrl(source.Path, localUrl);
+            rememberLocalPlaybackUrl(source.DirectStreamUrl, localUrl);
+            rememberDirectPlaybackUrl(localUrl, source.DirectStreamUrl, source.Container);
+            if (source.Path === localUrl && source.IsRemote === false) {
+                return source;
+            }
+            changed = true;
+            return Object.assign({}, source, {
+                // Keep DirectStreamUrl untouched: external players need the
+                // original SmartStrm URL. The in-app player uses Path below.
+                Path: localUrl,
+                IsRemote: false,
+                Protocol: 'Http'
+            });
+        });
+        sources.sort(function (left, right) {
+            return mediaSourcePriority(right) - mediaSourcePriority(left);
+        });
+        if (sources.some(function (source, index) { return source !== payload.MediaSources[index]; })) {
+            changed = true;
+        }
+        if (changed) {
+            var normalized = Object.assign({}, payload, {
+                MediaSources: sources,
+                MediaSourceCount: sources.length
+            });
+            debug('PlaybackInfo rewrote Xunlei source to local Jellyfin-rs proxy sources=' + sources.length);
+            return { payload: normalized, changed: true };
+        }
+        return { payload: payload, changed: false };
+    }
+
+    function normalizePlaybackInfoResponse(request, response) {
+        if (!isPlaybackInfoRequest(request.url) || !response || !response.ok) {
+            return Promise.resolve(response);
+        }
+        return response.clone().json().then(function (payload) {
+            var result = rewritePlaybackInfoPayload(payload, request.url);
+            return result.changed ? jsonResponseLike(response, result.payload) : response;
+        }).catch(function () {
+            return response;
+        });
+    }
+
     // The compatibility layer sometimes needs a second metadata request to
     // fill in counts or episode overviews. Those requests used to go straight
     // through nativeFetch, so they bypassed both the disk cache and the
@@ -1820,7 +2401,9 @@
     function normalizeMetadataResponse(request, response, nativeFetch) {
         return augmentItemDetailResponse(request, response, nativeFetch).then(function (normalized) {
             return removeNestedSeriesFromList(request, normalized, nativeFetch).then(function (withoutNested) {
-                return enrichEpisodeListOverviews(request, withoutNested, nativeFetch);
+                return enrichEpisodeListOverviews(request, withoutNested, nativeFetch).then(function (enriched) {
+                    return dedupeHomeItemsResponse(request, enriched);
+                });
             });
         });
     }
@@ -3111,9 +3694,36 @@
         var compatibleFetch = function (input, init) {
             var request;
             try {
-                request = new Request(input, init);
+                if (input instanceof Request && isPlaybackInfoRequest(input.url)) {
+                    request = new Request(proxyPlaybackUrl(input.url), input);
+                    debug('fetch 播放信息启用服务器代理');
+                } else if (typeof input === 'string' && isPlaybackInfoRequest(input)) {
+                    request = new Request(proxyPlaybackUrl(input), init);
+                    debug('fetch 播放信息启用服务器代理');
+                } else if (input instanceof Request) {
+                    request = new Request(proxyPlaybackUrl(input.url), input);
+                    if (request.url !== input.url) {
+                        debug('fetch 视频流启用服务器代理');
+                    }
+                } else if (typeof input === 'string') {
+                    request = new Request(proxyPlaybackUrl(input), init);
+                    if (request.url !== new Request(input, init).url) {
+                        debug('fetch 视频流启用服务器代理');
+                    }
+                } else {
+                    request = new Request(input, init);
+                }
             } catch (_) {
                 return nativeFetch(input, init);
+            }
+
+            // A normal fetch to the signed Xunlei URL may be rejected by CORS
+            // after SmartStrm's redirect, while a media element can consume
+            // the same URL directly. Keep the fast client-side attempt, but
+            // retain a deterministic same-origin fallback for fetch callers.
+            var directMediaFallbackUrl = directPlaybackFallbackUrl(request.url);
+            if (directMediaFallbackUrl) {
+                directMediaFallbackUrl = videoStreamProxyUrl(directMediaFallbackUrl);
             }
 
             if (request.method === 'GET' && isSubtitleJsonRequest(request.url)) {
@@ -3122,7 +3732,12 @@
 
             var networkFetch = function () {
                 if (request.method !== 'GET') {
-                    return nativeFetch(input, init);
+                    // Use the rebuilt Request so PlaybackInfo also carries the
+                    // Jellyfin-rs proxy marker. This is important for remote
+                    // STRM sources whose browser URL is not directly playable.
+                    return isPlaybackInfoRequest(request.url)
+                        ? nativeFetch(request)
+                        : nativeFetch(input, init);
                 }
                 var match = isSeriesChildrenUrl(request.url);
                 if (!match) {
@@ -3131,7 +3746,14 @@
                             return fallbackEmptyShowSeasons(request, response, nativeFetch);
                         });
                     }
-                    return nativeFetch(request);
+                    var directFetch = nativeFetch(request);
+                    if (!directMediaFallbackUrl) {
+                        return directFetch;
+                    }
+                    return directFetch.catch(function () {
+                        debug('迅雷直连 fetch 被浏览器拒绝，回落同源代理');
+                        return nativeFetch(new Request(directMediaFallbackUrl, request));
+                    });
                 }
 
                 debug('intercept ' + debugUrl(request.url));
@@ -3216,13 +3838,15 @@
             // cache/network decision. Normalizing both inside and outside the
             // cache layer makes every detail/episode fallback request run twice.
             return fetchWithMetadataCache(request, networkFetch).then(function (response) {
-                if (isPlaybackInfoRequest(request.url)) {
-                    rememberExternalPlayback(response);
-                }
                 // Cached detail responses may predate this compatibility layer.
                 // Normalize those too, so an old zero-count entry cannot keep a
                 // series page empty forever.
-                return normalizeMetadataResponse(request, response, nativeFetch);
+                return normalizePlaybackInfoResponse(request, response).then(function (playbackResponse) {
+                    if (isPlaybackInfoRequest(request.url)) {
+                        rememberExternalPlayback(playbackResponse);
+                    }
+                    return normalizeMetadataResponse(request, playbackResponse, nativeFetch);
+                });
             });
         };
         compatibleFetch.__jelliumSeriesCompatInstalled = true;
