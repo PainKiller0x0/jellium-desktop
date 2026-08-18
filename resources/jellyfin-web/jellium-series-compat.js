@@ -1302,6 +1302,15 @@
                 return media.__jelliumForcedPlaybackUrl;
             }
             var direct = mappedDirectPlaybackUrl(local);
+            if (direct !== local) {
+                // Native WebView2 playback can consume SmartStrm's signed
+                // redirect directly. Going through jellyfin-rs here turns
+                // MKV/HEVC sources into a browser-incompatible proxy stream;
+                // the media error handler below still keeps that route as a
+                // deterministic fallback.
+                debug('媒体源优先使用 SmartStrm 直连地址');
+                return direct;
+            }
             var redirect = mappedRedirectPlaybackUrl(local);
             if (redirect !== local) {
                 debug('媒体源通过本机 302 跳转直连迅雷，失败时回落本地代理');
@@ -2169,22 +2178,36 @@
                 return source;
             }
             var localUrl = xunleiLocalPlaybackUrl(requestUrl, itemId, source);
+            var directUrl = String(source.Path || '').trim();
+            if (!/^https?:\/\//i.test(directUrl)) {
+                directUrl = String(source.DirectStreamUrl || '').trim();
+            }
+            var externalUrl = /^https?:\/\//i.test(String(source.DirectStreamUrl || '').trim())
+                ? String(source.DirectStreamUrl).trim()
+                : directUrl;
             // Jellyfin's playback manager may use Path, DirectStreamUrl, or a
             // URL assembled from the original source object depending on the
-            // selected client/player. Keep all known remote forms mapped to
-            // the same-origin proxy URL so the in-app player and the external
-            // player button cannot diverge.
-            rememberLocalPlaybackUrl(source.Path, localUrl);
-            rememberLocalPlaybackUrl(source.DirectStreamUrl, localUrl);
-            rememberDirectPlaybackUrl(localUrl, source.DirectStreamUrl, source.Container);
-            if (source.Path === localUrl && source.IsRemote === false) {
+            // selected client/player. Prefer the signed SmartStrm URL for
+            // native playback and retain the source-aware jellyfin-rs URL as
+            // the error fallback.
+            if (directUrl) {
+                if (externalUrl && externalUrl !== directUrl) {
+                    rememberDirectPlaybackUrl(directUrl, externalUrl, source.Container);
+                }
+                // Register this last so a failed external URL falls back to
+                // the source-aware server route rather than the STRM path.
+                rememberDirectPlaybackUrl(localUrl, externalUrl || directUrl, source.Container);
+                if (source.DirectStreamUrl && source.DirectStreamUrl !== directUrl) {
+                    rememberDirectPlaybackUrl(source.DirectStreamUrl, directUrl, source.Container);
+                }
+            }
+            if (source.Path === directUrl && source.DirectStreamUrl === directUrl && source.IsRemote === false) {
                 return source;
             }
             changed = true;
             return Object.assign({}, source, {
-                // Keep DirectStreamUrl untouched: external players need the
-                // original SmartStrm URL. The in-app player uses Path below.
-                Path: localUrl,
+                Path: directUrl || localUrl,
+                DirectStreamUrl: externalUrl || source.DirectStreamUrl,
                 IsRemote: false,
                 Protocol: 'Http'
             });

@@ -29,7 +29,7 @@ const LOCAL_PROXY_PORT: u16 = 39782;
 // Bump whenever the bundled compatibility layer changes. WebView2 keeps a
 // persistent HTTP cache between launches, so reusing this query value can
 // silently load an older script even when the executable contains new code.
-const FRONTEND_CACHE_BUSTER: &str = "series-compat-47";
+const FRONTEND_CACHE_BUSTER: &str = "series-compat-48";
 const PROXY_QUEUE_CAPACITY: usize = 64;
 const EXTERNAL_PLAYER_ROUTE: &str = "/__jellium/open-external";
 const REDIRECT_STREAM_ROUTE: &str = "/__jellium/redirect-stream";
@@ -1283,8 +1283,8 @@ mod tests {
         let patched = super::patch_index(br#"<html><head></head></html>"#.to_vec());
         let text = String::from_utf8(patched).unwrap();
         assert!(text.contains("jellium-series-compat.js"));
-        assert!(text.contains("series-compat-47"));
-        assert!(text.contains("jellium-nord.css?v=series-compat-47"));
+        assert!(text.contains("series-compat-48"));
+        assert!(text.contains("jellium-nord.css?v=series-compat-48"));
         assert!(!text.contains("theme-park.dev"));
         assert!(text.contains("rel=\"preload\" as=\"style\""));
     }

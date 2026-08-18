@@ -226,25 +226,19 @@ const xunleiSource = normalizedPlayback.MediaSources.find(source => source.Id ==
 assert.ok(xunleiSource, 'the Xunlei source should remain available');
 assert.match(
   xunleiSource.Path,
-  /^https:\/\/jellium\.test\/Videos\/xunlei-item\/xunlei_737763560\/stream\.mp4\?/,
-  'versioned Xunlei playback should use the source-aware same-origin video proxy',
+  /^https:\/\/smartstrm\.test\/xunlei_737763560\/demo\.strm$/,
+  'versioned Xunlei playback should use the SmartStrm direct source',
 );
-assert.match(xunleiSource.Path, /JellyfinRsProxy=1/);
 assert.equal(xunleiSource.IsRemote, false);
 assert.equal(
   xunleiSource.DirectStreamUrl,
   'https://smartstrm.test/xunlei_737763560/demo.mp4',
-  'the external-player URL must stay untouched',
-);
-assert.equal(
-  new URL(xunleiSource.Path).searchParams.get('mediaSourceId'),
-  'xunlei_737763560',
-  'the source id should remain available for legacy proxy routes',
+  'the direct playback URL should stay on SmartStrm',
 );
 assert.match(
   context.window.__jelliumExternalPlayback.url,
   /^https:\/\/jellium\.test\/__jellium\/redirect-stream\?/,
-  'the external-player fallback should use a local redirect for Xunlei',
+  'the external-player fallback should keep using the local redirect',
 );
 assert.equal(normalizedPlayback.MediaSources[0].Id, 'xunlei_737763560');
 
@@ -255,7 +249,7 @@ await context.window.fetch(new Request(xunleiSource.Path, {
 assert.equal(
   fetchUrls.at(-1),
   xunleiSource.DirectStreamUrl,
-  'media fetches should follow the direct Xunlei URL instead of relaying bytes through jellyfin-rs',
+  'media fetches should follow the SmartStrm direct URL instead of relaying bytes through jellyfin-rs',
 );
 
 context.window.__jelliumHomePlaybackTest.clearExternalPlaybackState('test cleanup');
@@ -321,14 +315,14 @@ const media = new FakeMedia();
 media.src = xunleiSource.Path;
 assert.match(
   media.src,
-  /^https:\/\/jellium\.test\/__jellium\/redirect-stream\?/,
-  'in-app playback should use a local redirect to the direct Xunlei URL',
+  /^https:\/\/smartstrm\.test\/xunlei_737763560\/demo\.mp4$/,
+  'in-app playback should use the SmartStrm direct URL',
 );
 media.dispatchEvent({ type: 'error' });
 assert.equal(
   media.src.startsWith('https://jellium.test/Videos/xunlei-item/xunlei_737763560/stream.mp4?'),
   true,
-  'a failed direct source should fall back to the same-origin proxy',
+  'a failed SmartStrm source should fall back to the source-aware same-origin proxy',
 );
 
 console.log('Jellium home deduplication and Xunlei playback runtime regression test passed');
