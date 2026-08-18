@@ -32,6 +32,7 @@
     var overlaySubtitleSession = null;
     var overlaySubtitleSequence = 0;
     var externalPlayback = null;
+    var externalPlaybackRoute = '';
     var playbackInfoSeen = false;
     var localPlaybackUrlMap = new Map();
     var directPlaybackUrlMap = new Map();
@@ -1116,6 +1117,22 @@
             directPlaybackFallbackMap.get(key.path) || null;
     }
 
+    function clearExternalPlaybackState(reason) {
+        externalPlayback = null;
+        externalPlaybackRoute = '';
+        playbackInfoSeen = false;
+        window.__jelliumExternalPlayback = null;
+        var button = document.getElementById('jellium-external-player');
+        var floating = document.getElementById('jellium-external-player-floating');
+        if (button) {
+            button.remove();
+        }
+        if (floating) {
+            floating.remove();
+        }
+        debug('外部播放器状态已清理 reason=' + (reason || 'unknown'));
+    }
+
     function rememberExternalPlaybackPayload(payload) {
         playbackInfoSeen = true;
         var sources = payload && Array.isArray(payload.MediaSources) ? payload.MediaSources : [];
@@ -1126,8 +1143,7 @@
             return candidate && candidate.DirectStreamUrl && !candidate.TranscodingUrl;
         });
         if (!source) {
-            externalPlayback = null;
-            window.__jelliumExternalPlayback = null;
+            clearExternalPlaybackState('no direct source');
             debug('播放信息未找到直出源 MediaSources=' + sources.length);
             ensureExternalPlayerButton();
             return;
@@ -1144,6 +1160,7 @@
             container: source.Container || '',
             updatedAt: Date.now()
         };
+        externalPlaybackRoute = window.location.href;
         window.__jelliumExternalPlayback = externalPlayback;
         debug('直出源已捕获 codec=' + externalPlayback.codec +
             ' container=' + externalPlayback.container);
@@ -1372,7 +1389,11 @@
             var oldText = button.textContent;
             button.disabled = true;
             button.textContent = '启动中…';
-            openExternalPlayback().catch(function (error) {
+            openExternalPlayback().then(function () {
+                // PotPlayer is a one-shot handoff. Do not leave a stale button
+                // around that can relaunch the last episode on another page.
+                clearExternalPlaybackState('PotPlayer started');
+            }).catch(function (error) {
                 debug('外部播放器启动失败=' + (error && error.message || String(error)));
                 window.alert(error && error.message || '启动 PotPlayer 失败');
             }).then(function () {
@@ -1384,6 +1405,10 @@
     }
 
     function ensureExternalPlayerButton() {
+        if (externalPlayback && externalPlaybackRoute &&
+                window.location.href !== externalPlaybackRoute) {
+            clearExternalPlaybackState('route changed');
+        }
         var media = document.querySelector('video');
         var existing = document.getElementById('jellium-external-player');
         var floating = document.getElementById('jellium-external-player-floating');
@@ -2105,12 +2130,16 @@
 
     function xunleiLocalPlaybackUrl(requestUrl, itemId, source) {
         var container = String(source && source.Container || '').replace(/[^a-z0-9]/gi, '').toLowerCase() || 'mp4';
+        var sourceId = String(source && source.Id || itemId);
+        var sourcePath = sourceId && sourceId !== itemId
+            ? '/Videos/' + encodeURIComponent(itemId) + '/' + encodeURIComponent(sourceId) + '/stream.' + encodeURIComponent(container)
+            : '/Videos/' + encodeURIComponent(itemId) + '/stream.' + encodeURIComponent(container);
         var url = new URL(
-            '/Videos/' + encodeURIComponent(itemId) + '/stream.' + encodeURIComponent(container),
+            sourcePath,
             window.location.origin
         );
         url.searchParams.set('Static', 'true');
-        url.searchParams.set('mediaSourceId', source && source.Id || itemId);
+        url.searchParams.set('mediaSourceId', sourceId);
         var deviceId = playbackApiValue('deviceId', '', requestUrl);
         var apiKey = playbackApiValue('accessToken', '', requestUrl);
         if (deviceId) {

@@ -11,7 +11,8 @@ const instrumented = source.replace(
     window.__jelliumHomePlaybackTest = {
         dedupe: dedupeHomeItemsPayload,
         rewrite: rewritePlaybackInfoPayload,
-        installMediaSourceProxy: installMediaSourceProxy
+        installMediaSourceProxy: installMediaSourceProxy,
+        clearExternalPlaybackState: clearExternalPlaybackState
     };
 })();
 `,
@@ -225,8 +226,8 @@ const xunleiSource = normalizedPlayback.MediaSources.find(source => source.Id ==
 assert.ok(xunleiSource, 'the Xunlei source should remain available');
 assert.match(
   xunleiSource.Path,
-  /^https:\/\/jellium\.test\/Videos\/xunlei-item\/stream\.mp4\?/,
-  'in-app Xunlei playback should use the same-origin video proxy',
+  /^https:\/\/jellium\.test\/Videos\/xunlei-item\/xunlei_737763560\/stream\.mp4\?/,
+  'versioned Xunlei playback should use the source-aware same-origin video proxy',
 );
 assert.match(xunleiSource.Path, /JellyfinRsProxy=1/);
 assert.equal(xunleiSource.IsRemote, false);
@@ -234,6 +235,11 @@ assert.equal(
   xunleiSource.DirectStreamUrl,
   'https://smartstrm.test/xunlei_737763560/demo.mp4',
   'the external-player URL must stay untouched',
+);
+assert.equal(
+  new URL(xunleiSource.Path).searchParams.get('mediaSourceId'),
+  'xunlei_737763560',
+  'the source id should remain available for legacy proxy routes',
 );
 assert.match(
   context.window.__jelliumExternalPlayback.url,
@@ -250,6 +256,13 @@ assert.equal(
   fetchUrls.at(-1),
   xunleiSource.DirectStreamUrl,
   'media fetches should follow the direct Xunlei URL instead of relaying bytes through jellyfin-rs',
+);
+
+context.window.__jelliumHomePlaybackTest.clearExternalPlaybackState('test cleanup');
+assert.equal(
+  context.window.__jelliumExternalPlayback,
+  null,
+  'external-player state should be cleared after a handoff',
 );
 
 class FakeMedia {
@@ -313,7 +326,7 @@ assert.match(
 );
 media.dispatchEvent({ type: 'error' });
 assert.equal(
-  media.src.startsWith('https://jellium.test/Videos/xunlei-item/stream.mp4?'),
+  media.src.startsWith('https://jellium.test/Videos/xunlei-item/xunlei_737763560/stream.mp4?'),
   true,
   'a failed direct source should fall back to the same-origin proxy',
 );

@@ -21,6 +21,7 @@ for (const marker of [
   'function rewritePlaybackInfoPayload',
   'function xunleiLocalPlaybackUrl',
   'function rememberDirectPlaybackUrl',
+  'function clearExternalPlaybackState',
   'function mappedDirectPlaybackUrl',
   'function acceleratedPlaybackUrl',
   'function directPlaybackFallbackUrl',
