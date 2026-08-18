@@ -18,6 +18,64 @@
         return mediaStreams.find(s => s.Index === index) || null;
     }
 
+    // STRM-backed embedded text subtitles cannot be read reliably by mpv from
+    // the remote MKV after a seek. The server exposes short WebVTT windows;
+    // Jellium renders those windows in its WebView overlay, while mpv remains
+    // responsible for the actual video and audio.
+    function isTextSubtitleStream(stream) {
+        const codec = String(stream?.Codec || '').toLowerCase();
+        return [
+            'ass', 'ssa', 'subrip', 'srt', 'mov_text', 'webvtt', 'vtt',
+            'text', 'sami', 'stl', 'microdvd', 'mpl2', 'pjs', 'jacosub',
+            'subviewer', 'subviewer1', 'vplayer'
+        ].includes(codec);
+    }
+
+    function getEmbeddedSubtitleWindowUrl(options, stream, startSeconds) {
+        if (!options?.item?.Id || !stream?.Index && stream?.Index !== 0) {
+            return null;
+        }
+        const apiClient = window.ApiClient;
+        const serverAddress = apiClient?.serverAddress?.();
+        if (!serverAddress) return null;
+        const mediaSourceId = options.mediaSource?.Id || options.item.Id;
+        const ticks = Math.max(0, Math.floor((Number(startSeconds) || 0) * 10000000));
+        const url = new URL(
+            `/Videos/${encodeURIComponent(options.item.Id)}/${encodeURIComponent(mediaSourceId)}` +
+            `/Subtitles/${encodeURIComponent(stream.Index)}/${ticks}/Stream.vtt`,
+            serverAddress,
+        );
+        const accessToken = apiClient?.accessToken?.();
+        if (accessToken) url.searchParams.set('api_key', accessToken);
+        return url.toString();
+    }
+
+    function parseVttTimestamp(value) {
+        const match = String(value || '').trim().match(/^(?:(\d+):)?(\d{2}):(\d{2})[.,](\d{3})$/);
+        if (!match) return null;
+        return (Number(match[1] || 0) * 3600) +
+            (Number(match[2]) * 60) + Number(match[3]) + Number(match[4]) / 1000;
+    }
+
+    function parseVttCues(text) {
+        const lines = String(text || '').replace(/^\uFEFF/, '').split(/\r?\n/);
+        const cues = [];
+        for (let index = 0; index < lines.length; index += 1) {
+            const timing = lines[index].match(/^\s*(\S+)\s+-->\s+(\S+)/);
+            if (!timing) continue;
+            const start = parseVttTimestamp(timing[1]);
+            const end = parseVttTimestamp(timing[2]);
+            if (start == null || end == null || end <= start) continue;
+            const cueLines = [];
+            for (index += 1; index < lines.length && lines[index].trim() !== ''; index += 1) {
+                cueLines.push(lines[index]);
+            }
+            const cueText = cueLines.join('\n').trim();
+            if (cueText) cues.push({ start, end, text: cueText });
+        }
+        return cues;
+    }
+
     class mpvVideoPlayer extends window.MpvPlayerBase {
         constructor(args) {
             super(args);
@@ -48,6 +106,8 @@
             this._timeUpdated = false;
             this._currentPlayOptions = undefined;
             this._endedPending = false;
+            this._nativeSubtitleSession = null;
+            this._nativeSubtitleOverlay = null;
 
             // Support jellyfin-web v10.10.7
             this._currentAspectRatio = undefined;
@@ -76,12 +136,14 @@
                 if (time && !this._timeUpdated) this._timeUpdated = true;
                 this._seeking = false;
                 this._currentTime = time;
+                this._updateNativeSubtitleOverlay(time);
                 this.events.trigger(this, 'timeupdate');
             };
 
             this.handlers.onEnded = () => {
                 if (!this._endedPending) {
                     this._endedPending = true;
+                    this._stopNativeProgressiveSubtitle('ended');
                     this.onEndedInternal();
                 }
             };
@@ -153,10 +215,29 @@
             if (defaultSubIdx >= 0) {
                 const subStream = getStreamByIndex(streams, defaultSubIdx);
                 if (subStream && subStream.DeliveryMethod === 'External' && subStream.DeliveryUrl) {
+                    this._stopNativeProgressiveSubtitle('external subtitle');
                     externalSubUrl = subStream.DeliveryUrl;
                 } else {
-                    const relIdx = getRelativeIndexByType(streams, defaultSubIdx, 'Subtitle');
-                    subParam = relIdx != null ? relIdx : MpvPlayerBase.TRACK_DISABLE;
+                    if (isTextSubtitleStream(subStream)) {
+                        this._startNativeProgressiveSubtitle(subStream);
+                    } else {
+                        this._stopNativeProgressiveSubtitle('embedded non-text subtitle');
+                        const relIdx = getRelativeIndexByType(streams, defaultSubIdx, 'Subtitle');
+                        subParam = relIdx != null ? relIdx : MpvPlayerBase.TRACK_DISABLE;
+                    }
+                }
+            } else {
+                this._stopNativeProgressiveSubtitle('subtitle disabled');
+            }
+
+            // Native overlay subtitles and mpv subtitles are mutually exclusive.
+            // Text subtitles are served by the bounded WebVTT window above;
+            // non-text subtitles still use mpv's embedded track selection.
+            if (defaultSubIdx >= 0) {
+                const selected = getStreamByIndex(streams, defaultSubIdx);
+                if (selected && isTextSubtitleStream(selected) &&
+                        !(selected.DeliveryMethod === 'External' && selected.DeliveryUrl)) {
+                    subParam = MpvPlayerBase.TRACK_DISABLE;
                 }
             }
 
@@ -169,17 +250,168 @@
 
         setSubtitleStreamIndex(index) {
             if (index == null || index < 0) {
+                this._stopNativeProgressiveSubtitle('subtitle disabled');
                 window.api.player.setSubtitleStream(MpvPlayerBase.TRACK_DISABLE);
                 return;
             }
             const streams = this._currentPlayOptions?.mediaSource?.MediaStreams || [];
             const stream = getStreamByIndex(streams, index);
             if (stream && stream.DeliveryMethod === 'External' && stream.DeliveryUrl) {
+                this._stopNativeProgressiveSubtitle('external subtitle');
+                window.api.player.setSubtitleStream(MpvPlayerBase.TRACK_DISABLE);
                 window.api.player.addSubtitleStream(stream.DeliveryUrl);
                 return;
             }
+            if (isTextSubtitleStream(stream)) {
+                window.api.player.setSubtitleStream(MpvPlayerBase.TRACK_DISABLE);
+                this._startNativeProgressiveSubtitle(stream);
+                return;
+            }
+            this._stopNativeProgressiveSubtitle('embedded non-text subtitle');
             const relIdx = getRelativeIndexByType(streams, index, 'Subtitle');
             window.api.player.setSubtitleStream(relIdx != null ? relIdx : MpvPlayerBase.TRACK_DISABLE);
+        }
+
+        _ensureNativeSubtitleOverlay() {
+            const dlg = this._videoDialog;
+            if (!dlg) return null;
+            let overlay = dlg.querySelector('.mpvNativeSubtitleOverlay');
+            if (!overlay) {
+                overlay = document.createElement('div');
+                overlay.className = 'mpvNativeSubtitleOverlay';
+                overlay.style.cssText = [
+                    'position:absolute', 'left:5%', 'right:5%', 'bottom:9%',
+                    'z-index:2147483000', 'display:flex', 'justify-content:center',
+                    'pointer-events:none', 'text-align:center', 'white-space:pre-wrap',
+                    'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+                    'font-size:clamp(18px,3vw,42px)', 'font-weight:600',
+                    'line-height:1.35', 'color:#fff',
+                    'text-shadow:0 2px 3px #000,0 -1px 2px #000,2px 0 2px #000,-2px 0 2px #000',
+                    'visibility:hidden'
+                ].join(';');
+                dlg.appendChild(overlay);
+            }
+            this._nativeSubtitleOverlay = overlay;
+            return overlay;
+        }
+
+        _clearNativeSubtitleOverlay() {
+            const overlay = this._nativeSubtitleOverlay || this._videoDialog?.querySelector('.mpvNativeSubtitleOverlay');
+            if (overlay) {
+                overlay.textContent = '';
+                overlay.style.visibility = 'hidden';
+            }
+        }
+
+        _stopNativeProgressiveSubtitle(reason) {
+            const session = this._nativeSubtitleSession;
+            if (!session) {
+                this._clearNativeSubtitleOverlay();
+                return;
+            }
+            this._nativeSubtitleSession = null;
+            if (session.controller) session.controller.abort();
+            this._clearNativeSubtitleOverlay();
+            console.debug(`[Media] [${this.logTag}] native subtitles stopped: ${reason || 'switch'}`);
+        }
+
+        _startNativeProgressiveSubtitle(stream) {
+            this._stopNativeProgressiveSubtitle('switch');
+            const options = this._currentPlayOptions;
+            if (!options || !stream || !this._ensureNativeSubtitleOverlay()) return;
+            const session = {
+                stream,
+                options,
+                cues: [],
+                loadedFrom: 0,
+                loadedUntil: 0,
+                loading: false,
+                controller: null,
+                requestStart: -1,
+                runId: 0
+            };
+            this._nativeSubtitleSession = session;
+            const currentSeconds = Math.max(0, (Number(this._currentTime) || 0) / 1000);
+            this._loadNativeSubtitleWindow(session, Math.max(0, currentSeconds - 5), false);
+        }
+
+        _loadNativeSubtitleWindow(session, startSeconds, append) {
+            if (this._nativeSubtitleSession !== session) return;
+            const start = Math.max(0, Number(startSeconds) || 0);
+            if (session.loading && append) return;
+            if (session.controller) session.controller.abort();
+            session.controller = new AbortController();
+            session.loading = true;
+            session.requestStart = start;
+            const runId = ++session.runId;
+            if (!append) {
+                session.cues = [];
+                session.loadedFrom = start;
+                session.loadedUntil = start;
+                this._clearNativeSubtitleOverlay();
+            }
+            const url = getEmbeddedSubtitleWindowUrl(session.options, session.stream, start);
+            if (!url) {
+                session.loading = false;
+                return;
+            }
+            const headers = new Headers({ Accept: 'text/vtt' });
+            console.debug(`[Media] [${this.logTag}] subtitle window start=${start.toFixed(3)}s`);
+            fetch(url, {
+                method: 'GET',
+                headers,
+                credentials: 'include',
+                cache: 'no-store',
+                signal: session.controller.signal
+            }).then(response => {
+                if (!response.ok) throw new Error(`subtitle window status=${response.status}`);
+                return response.text();
+            }).then(body => {
+                if (this._nativeSubtitleSession !== session || session.runId !== runId) return;
+                const cues = parseVttCues(body);
+                if (!append) session.cues = [];
+                for (const cue of cues) {
+                    if (!session.cues.some(existing => existing.start === cue.start &&
+                            existing.end === cue.end && existing.text === cue.text)) {
+                        session.cues.push(cue);
+                    }
+                }
+                session.cues.sort((a, b) => a.start - b.start || a.end - b.end);
+                session.loadedFrom = append ? Math.min(session.loadedFrom, start) : start;
+                session.loadedUntil = append ? Math.max(session.loadedUntil, start + 30) : start + 30;
+                this._updateNativeSubtitleOverlay(this._currentTime);
+                console.debug(`[Media] [${this.logTag}] subtitle window ready cues=${cues.length}`);
+            }).catch(error => {
+                if (error?.name !== 'AbortError' && this._nativeSubtitleSession === session && session.runId === runId) {
+                    console.warn(`[Media] [${this.logTag}] subtitle window failed:`, error);
+                }
+            }).finally(() => {
+                if (this._nativeSubtitleSession === session && session.runId === runId) {
+                    session.loading = false;
+                }
+            });
+        }
+
+        _updateNativeSubtitleOverlay(timeMs) {
+            const session = this._nativeSubtitleSession;
+            if (!session) return;
+            const current = Math.max(0, (Number(timeMs) || 0) / 1000);
+            const rate = Math.max(1, Number(this._playRate) || 1);
+            const subtitleTime = current - (Number(this._currentSubtitleOffset) || 0);
+            const active = session.cues.filter(cue => subtitleTime >= cue.start && subtitleTime < cue.end);
+            const overlay = this._ensureNativeSubtitleOverlay();
+            if (overlay) {
+                overlay.textContent = active.map(cue => cue.text).join('\n');
+                overlay.style.visibility = active.length ? 'visible' : 'hidden';
+            }
+            if (session.loading) return;
+            const outside = current < session.loadedFrom - 2 || current > session.loadedUntil + 2;
+            const lead = Math.max(6, Math.min(18, rate * 6));
+            if (outside) {
+                this._loadNativeSubtitleWindow(session, Math.max(0, current - 5), false);
+            } else if (current >= session.loadedUntil - lead) {
+                this._loadNativeSubtitleWindow(session, Math.max(0, session.loadedUntil - 1), true);
+            }
         }
 
         setSecondarySubtitleStreamIndex(index) {}
@@ -226,6 +458,7 @@
         }
 
         stop(destroyPlayer) {
+            this._stopNativeProgressiveSubtitle('stop');
             if (!destroyPlayer && this._videoDialog && this._currentPlayOptions?.backdropUrl) {
                 const dlg = this._videoDialog;
                 const url = this._currentPlayOptions.backdropUrl;
@@ -243,6 +476,7 @@
         }
 
         removeMediaDialog() {
+            this._stopNativeProgressiveSubtitle('dialog removed');
             window.api.player.stop();
             if (window.jmpNative) window.jmpNative.playerOsdActive(false);
             window.api.player.setVideoRectangle(-1, 0, 0, 0);

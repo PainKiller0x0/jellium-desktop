@@ -2,6 +2,8 @@
 build/
 dist/
 src/target/
+target-win-wb2/
+win-wb2/target/
 
 # Python
 __pycache__/
